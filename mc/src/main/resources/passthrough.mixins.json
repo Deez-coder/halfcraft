@@ -1,0 +1,28 @@
+{
+	"required": true,
+	"package": "dev.halfcraft.passthrough.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"mixins": [
+		"AbstractArrowAccessor",
+		"BlockCollisionsMixin",
+		"BlockPlaceContextMixin",
+		"BlockStateSuffocationMixin",
+		"ClipContextMixin",
+		"EntityPushMixin",
+		"FishingHookMixin",
+		"LevelMixin",
+		"MobAccessor",
+		"MobMixin",
+		"PlayerMixin",
+		"PortalMixin",
+		"ProjectileMixin",
+		"ProxyMixin",
+		"ServerExplosionMixin",
+		"ServerPlayerMixin",
+		"VillagerMixin",
+		"WalkNodeEvaluatorMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

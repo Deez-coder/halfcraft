@@ -1,0 +1,26 @@
+{
+	"required": true,
+	"package": "dev.halfcraft.passthrough.client.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"AbstractClientPlayerMixin",
+		"AvatarRendererMixin",
+		"CameraMixin",
+		"ClientLevelMixin",
+		"EntityPickMixin",
+		"LivingEntityMixin",
+		"FogRendererMixin",
+		"GameRendererMixin",
+		"GlCommandEncoderMixin",
+		"GlSurfaceMixin",
+		"KeyMappingAccessor",
+		"LocalPlayerMixin",
+		"ToastManagerMixin",
+		"MinecraftMixin",
+		"MouseHandlerMixin",
+		"ScreenMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}
