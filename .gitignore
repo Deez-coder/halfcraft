@@ -1,0 +1,15 @@
+# build output
+hs/build/
+mc/build/
+mc/.gradle/
+mc/run/
+*.obj
+*.addon64
+*.log
+
+# the Half Sword SDK is generated from the game on your own PC: never commit it
+hs/third_party/sdk/
+hs/third_party/Dumper-7/
+
+# release packages go up as GitHub Releases, not into the repo
+*.zip

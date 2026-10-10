@@ -165,6 +165,7 @@ public final class HsConfig {
 		dispatcher.register(Commands.literal("hs")
 			.executes(HsConfig::help)
 			.then(Commands.literal("help").executes(HsConfig::help))
+			.then(Commands.literal("why").executes(MobDebug::why))
 			.then(Commands.literal("dealt").then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.0, 100.0)).executes(ctx -> {
 				data.dealt = DoubleArgumentType.getDouble(ctx, "multiplier");
 				return changed(ctx, String.format(Locale.ROOT, "damage dealt x%.2f", data.dealt));

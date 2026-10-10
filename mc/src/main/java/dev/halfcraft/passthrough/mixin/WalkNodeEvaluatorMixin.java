@@ -5,6 +5,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.pathfinder.PathType;
 import net.minecraft.world.level.pathfinder.WalkNodeEvaluator;
 import org.spongepowered.asm.mixin.Mixin;
@@ -24,20 +25,38 @@ abstract class WalkNodeEvaluatorMixin {
 		at = @At("HEAD"), cancellable = true)
 	private static void passthrough$hostGroundType(final BlockGetter level, final BlockPos pos, final CallbackInfoReturnable<PathType> cir) {
 		HostGround.Cell cell = HostGround.cellAt(pos);
+		BlockState state = level.getBlockState(pos);
+		boolean barrier = state.is(Blocks.BARRIER) && !(level instanceof Level l && l.dimension() != Level.OVERWORLD);
 		if (cell == null) {
 			// a barrier in the open (the player's, for support) isn't in anyone's way: it doesn't collide
-			if (level.getBlockState(pos).is(Blocks.BARRIER) && !(level instanceof Level l && l.dimension() != Level.OVERWORLD)) {
+			if (barrier) {
 				cir.setReturnValue(PathType.OPEN);
 			}
 
 			return;
 		}
 
-		if (cell.kind() == HostGround.Kind.LOW || !level.getBlockState(pos).isAir()) {
+		// a real block in the cell: vanilla's. Our barriers can't be left to vanilla: it reads "is this a full block"
+		// from a per-block-type cache built at startup, when a barrier's shape (BlockStateSuffocationMixin: the
+		// host cell's, none without one) was empty - every barrier was OPEN, the whole floor was air to mobs and
+		// those standing on it found no path at all
+		if (!state.isAir() && !barrier) {
 			return;
 		}
 
-		cir.setReturnValue(cell.kind() == HostGround.Kind.FENCE ? PathType.FENCE : PathType.BLOCKED);
+		if (cell.whole()) {
+			cir.setReturnValue(PathType.BLOCKED);
+		} else if (barrier) {
+			// a slope's support barrier: walked in, its floor where the slope is (getFloorLevel below). As a solid step
+			// (BLOCKED, the node on top) a low slope's next node stood more than a step above the mob: it jumped
+			cir.setReturnValue(PathType.OPEN);
+		} else {
+			cir.setReturnValue(switch (cell.kind()) {
+				case LOW -> PathType.OPEN;
+				case FENCE -> PathType.FENCE;
+				default -> PathType.BLOCKED;
+			});
+		}
 	}
 
 	@Inject(method = "getFloorLevel(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;)D", at = @At("RETURN"), cancellable = true)
