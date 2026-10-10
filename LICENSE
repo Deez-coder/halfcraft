@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 Deez-coder
+Copyright (c) 2026 holdup.lethimcook
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+This license covers HalfCraft's own code. Third-party code included here keeps its own license:
+hs/third_party/minhook (BSD 2-Clause, see its LICENSE.txt) and hs/third_party/reshade plus the ReShade
+*.fxh headers (Patrick Mours / crosire; BSD-3-Clause or MIT, ReShade.fxh CC0-1.0).
