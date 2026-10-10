@@ -17,7 +17,7 @@ i added as much as i can. this includes but is not limited to:
 works with half sword early access 0.6.1.5 and minecraft 26.3 (fabric).
 if half sword updates it will probably break until i update it too.
 both games run at once, so you need a decent pc.
-
+the mob and player movement system is based on  tiny voxels that are generated and sent to minecraft's collision system, same for blocks. blocks that depend on a block existing near it like torches,redstone use a barrier system that generates around the map. its not the best but it works if you want to directly place any block dependant block directly on halfsword ground.
 ## how to install
 
 download the zip from the [releases](../../releases) page and follow the README inside or follow this:
