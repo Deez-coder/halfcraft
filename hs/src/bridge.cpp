@@ -2037,14 +2037,18 @@ namespace
 		g_fightersRefresh = 0; // hidden: found by the next scan
 	}
 
-	// ---- night vision: Minecraft's, on Steve, lights Half Sword's own picture: more exposure on our camera, the
-	// shadows lifted and the highlights held back (Half Sword's local exposure), so the dark shows its detail ----
+	// ---- night vision: Minecraft's, on Steve, lights Half Sword's own picture through its own exposure (on our
+	// camera), the shadows lifted and the highlights held back (local exposure), so the dark shows its detail. A map
+	// with a fixed exposure (East Tower's night) gets more of it; one with automatic exposure (Ambush's night: kept dark
+	// by a floor under how much it may brighten) gets that floor lowered instead - more exposure on top of an automatic
+	// one turned the whole picture white ----
 	float g_nightVision = 0.0f; // 0..1 ("me": Minecraft's own strength, flickering as it runs out)
 	bool g_nightVisionOn = false;
 	struct MapExposure
 	{
 		bool known = false;
-		float bias = 1.0f, shadows = 1.0f, highlights = 1.0f; // the map's own (its strongest unbound volume's)
+		bool manual = false;                                    // fixed exposure (else automatic)
+		float bias = 1.0f, minBright = 0.03f, shadows = 1.0f, highlights = 1.0f; // the map's own (its strongest unbound volume's)
 	} g_mapExposure;
 
 	MapExposure map_exposure(SDK::UWorld *world)
@@ -2063,14 +2067,19 @@ namespace
 		if (best != nullptr)
 		{
 			const SDK::FPostProcessSettings &s = best->Settings;
+			if (s.bOverride_AutoExposureMethod)
+				e.manual = s.AutoExposureMethod == SDK::EAutoExposureMethod::AEM_Manual;
 			if (s.bOverride_AutoExposureBias)
 				e.bias = s.AutoExposureBias;
+			if (s.bOverride_AutoExposureMinBrightness)
+				e.minBright = s.AutoExposureMinBrightness;
 			if (s.bOverride_LocalExposureShadowContrastScale)
 				e.shadows = s.LocalExposureShadowContrastScale;
 			if (s.bOverride_LocalExposureHighlightContrastScale)
 				e.highlights = s.LocalExposureHighlightContrastScale;
 		}
-		hslog::info("night vision: the map's exposure %.2f, shadows %.2f, highlights %.2f (%d volumes)", e.bias, e.shadows, e.highlights, found.Num());
+		hslog::info("night vision: the map's exposure %s, bias %.2f, floor %.3f, shadows %.2f, highlights %.2f (%d volumes)", e.manual ? "fixed" : "automatic",
+			e.bias, e.minBright, e.shadows, e.highlights, found.Num());
 		return e;
 	}
 
@@ -2085,6 +2094,7 @@ namespace
 			if (g_nightVisionOn)
 			{
 				s.bOverride_AutoExposureBias = 0;
+				s.bOverride_AutoExposureMinBrightness = 0;
 				s.bOverride_LocalExposureShadowContrastScale = 0;
 				s.bOverride_LocalExposureHighlightContrastScale = 0;
 				g_nightVisionOn = false;
@@ -2093,12 +2103,25 @@ namespace
 		}
 		if (!g_mapExposure.known)
 			g_mapExposure = map_exposure(world);
-		s.bOverride_AutoExposureBias = 1;
-		s.AutoExposureBias = g_mapExposure.bias + 2.5f * nv;
+		const MapExposure &e = g_mapExposure;
+		if (e.manual)
+		{
+			s.bOverride_AutoExposureBias = 1;
+			s.AutoExposureBias = e.bias + 2.0f * nv;
+		}
+		else
+		{
+			// the floor down (in steps of light: 0.5 -> 0.03 is 4 stops), so a dark scene may be brightened to normal;
+			// a bright one isn't touched
+			s.bOverride_AutoExposureMinBrightness = 1;
+			const float floor = std::min(e.minBright, 0.03f);
+			s.AutoExposureMinBrightness = std::exp(std::log(e.minBright) + (std::log(floor) - std::log(e.minBright)) * nv);
+		}
+		const float shadows = e.manual ? 0.3f : 0.5f, highlights = e.manual ? 0.45f : 0.6f;
 		s.bOverride_LocalExposureShadowContrastScale = 1;
-		s.LocalExposureShadowContrastScale = std::min(g_mapExposure.shadows, g_mapExposure.shadows + (0.3f - g_mapExposure.shadows) * nv);
+		s.LocalExposureShadowContrastScale = std::min(e.shadows, e.shadows + (shadows - e.shadows) * nv);
 		s.bOverride_LocalExposureHighlightContrastScale = 1;
-		s.LocalExposureHighlightContrastScale = std::min(g_mapExposure.highlights, g_mapExposure.highlights + (0.45f - g_mapExposure.highlights) * nv);
+		s.LocalExposureHighlightContrastScale = std::min(e.highlights, e.highlights + (highlights - e.highlights) * nv);
 		g_nightVisionOn = true;
 	}
 
