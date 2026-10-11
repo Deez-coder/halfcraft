@@ -1,3 +1,5 @@
+(this mod is unrelated to any other projects/maps by the same name)
+
 passthrough mod for minecraft to be inside half sword.
 
 (first i declare that this mod was made almost entirely with ai, it was made in a few days using claude opus and the universal modder plugin)
