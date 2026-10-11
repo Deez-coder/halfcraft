@@ -151,7 +151,28 @@ namespace
 		double health = 100, consciousness = 100, limbs[10] = {}, stamina = 100;
 		bool hidden = false;
 		ULONGLONG since = 0; // when this body became the stand-in
+		SDK::USceneComponent *meshParent = nullptr; // what its body hung from before it was pinned (put back as it was)
+		bool meshParentKnown = false;
+		// how its body met other bodies (collision channel 16) before it was pinned (put back as it was: forced to
+		// "block", it was kicked the instant its physics came back - a knee put out)
+		SDK::ECollisionResponse bodyResponse = SDK::ECollisionResponse::ECR_Block;
 	} g_standIn;
+	// the body just given back to Half Sword: its first moments are watched for a burst of speed (it used to be flung
+	// out of whatever it was put back into, often to its death)
+	Ref g_restored;
+	ULONGLONG g_restoredAt = 0;
+	bool g_restorePending = false;               // placed, physics still off: it comes on after kRestorePhysicsDelayMs
+	constexpr ULONGLONG kRestorePhysicsDelayMs = 120;
+	constexpr ULONGLONG kRestoreMaxWaitMs = 800;   // its legs coming down take at most this long
+	constexpr double kRestoreLegsDown = 70.0;      // cm of hips over its lowest foot: its legs are down
+	constexpr double kRestoreStillCm = 0.5;        // hips and feet moved less than this in a frame...
+	constexpr int kRestoreStillFrames = 4;         // ...this many frames running: still
+	constexpr ULONGLONG kRestoreZeroMs = 150;      // then, physics on, all its speed cleared every frame this long
+	bool g_restorePlaced = false;                  // its feet put on the ground (once, before the stillness wait)
+	int g_restoreStill = 0;
+	SDK::FVector g_restoreMarks[3] = {};
+	constexpr ULONGLONG kRestoreSettleMs = 1500; // then this long watched and kept from harm
+	constexpr double kRestoreMaxSpeed = 500.0;   // cm/s: faster than this in that time is the physics shoving it
 	constexpr ULONGLONG kStandInSettle = 3000; // ms a new stand-in runs as Half Sword's own before its logic is paused
 	struct Placed
 	{
@@ -401,12 +422,12 @@ namespace
 
 	// ---- ground ----
 	/// The highest static surface (WorldStatic: floors, walls, props; not bodies or loose weapons) below `from`.
-	bool ground_z(SDK::UWorld *world, double x, double y, double fromZ, double &outZ)
+	bool ground_z(SDK::UWorld *world, double x, double y, double fromZ, double &outZ, bool withBlocks = false)
 	{
 		SDK::EObjectTypeQuery types[] = {SDK::EObjectTypeQuery::ObjectTypeQuery1};
 		SDK::TArray<SDK::EObjectTypeQuery> typeArray(types, 1, 1);
-		// not Minecraft's own blocks: the ground is Half Sword's
-		SDK::AActor *blocks[1] = {g_blockActor.alive() ? static_cast<SDK::AActor *>(g_blockActor.obj) : nullptr};
+		// not Minecraft's own blocks: the ground is Half Sword's (unless asked for: what a body stands on)
+		SDK::AActor *blocks[1] = {g_blockActor.alive() && !withBlocks ? static_cast<SDK::AActor *>(g_blockActor.obj) : nullptr};
 		SDK::TArray<SDK::AActor *> ignore(blocks, blocks[0] != nullptr ? 1 : 0, 1);
 		SDK::FHitResult hit{};
 		const bool ok = SDK::UKismetSystemLibrary::LineTraceSingleForObjects(world, SDK::FVector(x, y, fromZ), SDK::FVector(x, y, fromZ - 20000.0),
@@ -1980,25 +2001,242 @@ namespace
 		for (int i = 0; i < 10; ++i)
 			*stand_in_limbs(w, i) = g_standIn.limbs[i];
 		hide_actor(w, false);
-		if (w->Mesh != nullptr)
+		// on something solid first: it stood wherever Steve was, and Steve can be a little in Half Sword's ground or in
+		// a block's box - physics coming back on in there flung the body out, often to its death. The first solid
+		// thing under the hips (a block's box too: Steve may stand on one)
+		const SDK::FVector at = w->K2_GetActorLocation();
+		const double half = w->CapsuleComponent != nullptr ? w->CapsuleComponent->CapsuleHalfHeight : 90.0;
+		double groundZ = 0.0;
+		if (g_world != nullptr && ground_z(g_world, at.X, at.Y, at.Z + 50.0, groundZ, true) && groundZ > at.Z - half - 300.0)
 		{
-			w->Mesh->SetCollisionResponseToChannel(static_cast<SDK::ECollisionChannel>(16), SDK::ECollisionResponse::ECR_Block);
-			w->Mesh->SetAllBodiesSimulatePhysics(true);
+			SDK::FHitResult hit{};
+			w->K2_SetActorLocation(SDK::FVector(at.X, at.Y, groundZ + half + 5.0), false, &hit, true);
+			// and its feet out of the ground: the pinned pose's feet can hang below the capsule, and legs in the ground
+			// when physics came back were shoved out (a broken leg)
+			double low = 1e30;
+			if (w->Mesh != nullptr)
+				for (const wchar_t *b : {L"foot_l", L"foot_r", L"ball_l", L"ball_r", L"calf_l", L"calf_r"})
+					low = std::min(low, w->Mesh->GetSocketLocation(name(b)).Z);
+			// (not lowered when they hang over it: frozen in the air, its legs are drawn up; they come down while it
+			// walks again before its physics (settle_restored), and lowered first they came down into the ground)
+			double lift = 0.0;
+			const double footBefore = low;
+			if (low < 1e29 && low < groundZ + 2.0)
+			{
+				lift = groundZ + 4.0 - low;
+				const SDK::FVector now = w->K2_GetActorLocation();
+				w->K2_SetActorLocation(SDK::FVector(now.X, now.Y, now.Z + lift), false, &hit, true);
+			}
+			const double pelvisZ = w->Mesh != nullptr ? w->Mesh->GetSocketLocation(name(L"pelvis")).Z : 0.0;
+			auto *cdo = static_cast<SDK::AWillie_BP_C *>(g_willieClass->ClassDefaultObject);
+			hslog::info("stand-in back on the ground: %.0f cm %s; its lowest foot was %.0f cm %s the ground, moved %+.0f; hips %.0f cm over the ground; "
+				"fallen %d, crouched %d, kneeling %d/%d; body on its capsule at %.0f (a fresh one's %.0f), hanging from %s",
+				std::fabs(groundZ + half + 5.0 - at.Z), groundZ + half + 5.0 > at.Z ? "up" : "down", std::fabs(footBefore - groundZ),
+				footBefore >= groundZ ? "over" : "in", lift, pelvisZ - groundZ, int(w->Fallen), int(w->Is_Crouched), int(w->L_Kneel), int(w->R_Kneel),
+				w->Mesh != nullptr ? w->Mesh->RelativeLocation.Z : 0.0, cdo != nullptr && cdo->Mesh != nullptr ? cdo->Mesh->RelativeLocation.Z : 0.0,
+				w->Mesh != nullptr && w->Mesh->AttachParent == w->CapsuleComponent ? "the capsule" : "something else");
 		}
+		if (auto *cmc = w->CharacterMovement; cmc != nullptr)
+		{
+			// walking again at once, physics still off: its animation sees ground under it and puts its legs down (frozen
+			// with Steve in the air, they were drawn up to the hips - and put out when it was dropped onto them)
+			cmc->StopMovementImmediately();
+			cmc->SetComponentTickEnabled(true);
+			cmc->SetMovementMode(SDK::EMovementMode::MOVE_Walking, 0);
+		}
+		// its physics comes back a moment later, held still till then: its parts, moved along with Steve every frame,
+		// kept that speed when physics came back on at once (flung, every bone broken)
+		g_restored = g_standIn.ref;
+		g_restoredAt = GetTickCount64();
+		g_restorePending = true;
+		g_restorePlaced = false;
+		g_restoreStill = 0;
 		w->Blood_Bleed_Ok = true;
 		w->Blood_Splash_Ok = true;
 		stand_in_weapons(w, false);
-		if (w->CharacterMovement != nullptr)
-		{
-			w->CharacterMovement->SetComponentTickEnabled(true);
-			w->CharacterMovement->SetMovementMode(SDK::EMovementMode::MOVE_Walking, 0);
-		}
 		g_standInPlaced = {};
 		w->SetActorTickEnabled(true);
 		g_standIn.hidden = false;
 		g_standInObj = nullptr;
 		g_steveHits.clear();
 		hslog::info("stand-in restored");
+	}
+
+	// the given-back body's joints, unbreakable for its first moments: physics coming back on put a leg out of joint
+	// 31 ms in (the engine tears a joint past its break limit; Half Sword then calls the leg dislocated). Each joint's
+	// own limits, to put back
+	struct SavedJoint
+	{
+		SDK::FConstraintInstanceAccessor joint;
+		bool linear = false, angular = false;
+		float linearAt = 0.0f, angularAt = 0.0f;
+	};
+	std::vector<SavedJoint> g_savedJoints;
+	Ref g_savedJointsMesh;
+
+	void restore_joints()
+	{
+		if (g_savedJointsMesh.alive())
+			for (SavedJoint &s : g_savedJoints)
+			{
+				SDK::UConstraintInstanceBlueprintLibrary::SetLinearBreakable(s.joint, s.linear, s.linearAt);
+				SDK::UConstraintInstanceBlueprintLibrary::SetAngularBreakable(s.joint, s.angular, s.angularAt);
+			}
+		if (!g_savedJoints.empty())
+			hslog::info("the body given back: its %zu breakable joints breakable again", g_savedJoints.size());
+		g_savedJoints.clear();
+		g_savedJointsMesh = {};
+	}
+
+	void hold_joints(SDK::USkeletalMeshComponent *mesh)
+	{
+		restore_joints();
+		SDK::TArray<SDK::FConstraintInstanceAccessor> all;
+		mesh->GetConstraints(false, &all);
+		for (int i = 0; i < all.Num(); ++i)
+		{
+			SavedJoint s;
+			s.joint = all[i];
+			SDK::UConstraintInstanceBlueprintLibrary::GetLinearBreakable(s.joint, &s.linear, &s.linearAt);
+			SDK::UConstraintInstanceBlueprintLibrary::GetAngularBreakable(s.joint, &s.angular, &s.angularAt);
+			if (!s.linear && !s.angular)
+				continue;
+			SDK::UConstraintInstanceBlueprintLibrary::SetLinearBreakable(s.joint, false, s.linearAt);
+			SDK::UConstraintInstanceBlueprintLibrary::SetAngularBreakable(s.joint, false, s.angularAt);
+			g_savedJoints.push_back(s);
+		}
+		g_savedJointsMesh = {mesh, mesh->Index};
+		hslog::info("the body given back: %zu of its %d joints unbreakable for now", g_savedJoints.size(), all.Num());
+	}
+
+	/// The body just given back, its first moments: a burst of speed is the physics shoving it out of something, not
+	/// a move of its own - stopped.
+	void settle_restored()
+	{
+		if (!g_restored.alive())
+			return;
+		auto *w = as_willie(g_restored.obj);
+		if (w == nullptr || w->Mesh == nullptr || w->DED)
+		{
+			g_restorePending = false;
+			return;
+		}
+		const ULONGLONG now = GetTickCount64();
+		auto *mesh = w->Mesh;
+		if (g_restorePending)
+		{
+			// its legs down: hips this far over its lowest foot (a standing body's are ~90 cm)
+			static const SDK::FName pelvisName = name(L"pelvis");
+			double low = 1e30;
+			for (const wchar_t *b : {L"foot_l", L"foot_r", L"ball_l", L"ball_r", L"calf_l", L"calf_r"})
+				low = std::min(low, mesh->GetSocketLocation(name(b)).Z);
+			const double legs = mesh->GetSocketLocation(pelvisName).Z - low;
+			const ULONGLONG waited = now - g_restoredAt;
+			if (w->CharacterMovement != nullptr)
+				w->CharacterMovement->StopMovementImmediately(); // (still: its parts' speed goes to nothing)
+			const bool legsDone = legs >= kRestoreLegsDown || waited >= kRestoreMaxWaitMs;
+			if (waited >= kRestorePhysicsDelayMs && legsDone && !g_restorePlaced)
+			{
+				// its feet on the ground once more, as they are now (then it has to be still again: see below)
+				g_restorePlaced = true;
+				double groundZ = 0.0;
+				const SDK::FVector at = w->K2_GetActorLocation();
+				if (g_world != nullptr && low < 1e29 && ground_z(g_world, at.X, at.Y, at.Z + 50.0, groundZ, true) && std::fabs(low - groundZ - 4.0) > 2.0 &&
+					std::fabs(low - groundZ) < 150.0)
+				{
+					SDK::FHitResult hit{};
+					w->K2_SetActorLocation(SDK::FVector(at.X, at.Y, at.Z + groundZ + 4.0 - low), false, &hit, true);
+					hslog::info("the body given back: feet put on the ground, %+.0f cm", groundZ + 4.0 - low);
+				}
+				hslog::info("the body given back: legs %s (hips %.0f cm over its lowest foot) after %llu ms", legs >= kRestoreLegsDown ? "down" : "STILL UP",
+					legs, waited);
+			}
+			// still: its frozen parts' last move becomes their speed when physics takes them (placed 8 cm the frame before:
+			// flung at 5.8 m/s; legs swinging down as it stood: a knee put out). Hips and feet unmoved for a few frames
+			const SDK::FVector marks[3] = {mesh->GetSocketLocation(pelvisName), mesh->GetSocketLocation(name(L"foot_l")), mesh->GetSocketLocation(name(L"foot_r"))};
+			double moved = 0.0;
+			for (int i = 0; i < 3; ++i)
+				moved = std::max(moved, std::sqrt((marks[i].X - g_restoreMarks[i].X) * (marks[i].X - g_restoreMarks[i].X) +
+					(marks[i].Y - g_restoreMarks[i].Y) * (marks[i].Y - g_restoreMarks[i].Y) + (marks[i].Z - g_restoreMarks[i].Z) * (marks[i].Z - g_restoreMarks[i].Z)));
+			for (int i = 0; i < 3; ++i)
+				g_restoreMarks[i] = marks[i];
+			g_restoreStill = moved < kRestoreStillCm ? g_restoreStill + 1 : 0;
+			if (g_restorePlaced && (g_restoreStill >= kRestoreStillFrames || waited >= kRestoreMaxWaitMs + 600))
+			{
+				hslog::info("the body given back: still for %d frames (last move %.1f cm) after %llu ms", g_restoreStill, moved, waited);
+				// a free ragdoll, hanging from nothing, as every live fighter's body is (lab/lua/simbones.lua: an AI
+				// fighter's mesh has no parent). A new fight's body starts on its capsule with physics off, and Half Sword
+				// lets go of it as its physics starts; given back on the capsule, the walking capsule dragged the ragdoll
+				// along - a jolt forward every time, a knee put out every second or third
+				if (mesh->AttachParent != nullptr)
+					mesh->K2_DetachFromComponent(SDK::EDetachmentRule::KeepWorld, SDK::EDetachmentRule::KeepWorld, SDK::EDetachmentRule::KeepWorld, false);
+				mesh->SetCollisionResponseToChannel(static_cast<SDK::ECollisionChannel>(16), g_standIn.bodyResponse);
+				hold_joints(mesh);
+				mesh->SetAllBodiesSimulatePhysics(true);
+				mesh->SetAllPhysicsLinearVelocity(SDK::FVector(0, 0, 0), false);
+				mesh->SetAllPhysicsAngularVelocityInDegrees(SDK::FVector(0, 0, 0), false);
+				if (auto *cmc = w->CharacterMovement; cmc != nullptr)
+				{
+					cmc->StopMovementImmediately();
+					cmc->SetComponentTickEnabled(true);
+					cmc->SetMovementMode(SDK::EMovementMode::MOVE_Walking, 0);
+				}
+				g_restorePending = false;
+				g_restoredAt = now;
+				hslog::info("the body given back: its physics on again");
+			}
+		}
+		else if (now - g_restoredAt > kRestoreSettleMs)
+		{
+			restore_joints(); // (its own again: blows can put joints out)
+			return;
+		}
+		// its first moments: a burst of speed is the physics shoving it, not a move of its own - stopped, every frame;
+		// and whatever that did to it doesn't count (it is as Steve left it: the stand-in's health, limbs...)
+		if (!g_restorePending)
+		{
+			static const SDK::FName pelvis = name(L"pelvis");
+			const SDK::FVector v = mesh->GetPhysicsLinearVelocity(pelvis);
+			const double speed = std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z);
+			// (its very first moments: any speed at all is left over from before - none of its own yet)
+			if (now - g_restoredAt < kRestoreZeroMs)
+			{
+				mesh->SetAllPhysicsLinearVelocity(SDK::FVector(0, 0, 0), false);
+				mesh->SetAllPhysicsAngularVelocityInDegrees(SDK::FVector(0, 0, 0), false);
+			}
+			else if (speed > kRestoreMaxSpeed)
+			{
+				mesh->SetAllPhysicsLinearVelocity(SDK::FVector(0, 0, 0), false);
+				mesh->SetAllPhysicsAngularVelocityInDegrees(SDK::FVector(0, 0, 0), false);
+				hslog::info("the body given back was flung at %.0f cm/s, %llu ms in: stopped", speed, now - g_restoredAt);
+			}
+		}
+		// a bone broken or a joint put out anyway (not through the Break_ functions, block_restore_break): say which
+		{
+			static uint32_t last = 0;
+			const bool flags[] = {w->Leg_L_Broken, w->Leg_R_Broken, w->Arm_L_Broken, w->Arm_R_Broken, w->Back_Broken, w->Head_Broken,
+				w->Leg_L_Dislocated, w->Leg_R_Dislocated, w->Arm_L_Dislocated, w->Arm_R_Dislocated, w->Neck_Dislocated, w->Spine_Dislocated};
+			static const char *kNames[] = {"left leg broken", "right leg broken", "left arm broken", "right arm broken", "back broken", "head broken",
+				"left leg dislocated", "right leg dislocated", "left arm dislocated", "right arm dislocated", "neck dislocated", "spine dislocated"};
+			uint32_t bits = 0;
+			for (int i = 0; i < 12; ++i)
+				bits |= flags[i] ? (1u << i) : 0u;
+			if (bits != last)
+			{
+				for (int i = 0; i < 12; ++i)
+					if ((bits & (1u << i)) && !(last & (1u << i)))
+						hslog::info("the body given back: %s, %llu ms in%s", kNames[i], now - g_restoredAt, g_restorePending ? " (physics still off)" : "");
+				last = bits;
+			}
+		}
+		if (g_restored.obj == g_standIn.ref.obj)
+		{
+			w->Health = std::max(w->Health, g_standIn.health);
+			w->Consciousness = std::max(w->Consciousness, g_standIn.consciousness);
+			w->Bleeding = 0.0;
+			for (int i = 0; i < 10; ++i)
+				*stand_in_limbs(w, i) = std::max(*stand_in_limbs(w, i), g_standIn.limbs[i]);
+		}
 	}
 
 	/// A body that must stand exactly where its owner is (the fighters aim at its bones): Steve's stand-in, a mob's.
@@ -2019,8 +2257,11 @@ namespace
 			auto *cdo = static_cast<SDK::AWillie_BP_C *>(g_willieClass->ClassDefaultObject);
 			mesh->SetAllBodiesSimulatePhysics(false);
 			mesh->SetSimulatePhysics(false);
+			// (its size as it is in the world: given back, it hangs from nothing and its own scale is its size in the
+			// world; kept "relative", the capsule's scale - a fighter's random size, 0.939 - went on top of that, and the
+			// body shrank with every switch)
 			mesh->K2_AttachToComponent(w->CapsuleComponent, SDK::FName{}, SDK::EAttachmentRule::KeepRelative, SDK::EAttachmentRule::KeepRelative,
-				SDK::EAttachmentRule::KeepRelative, false);
+				SDK::EAttachmentRule::KeepWorld, false);
 			SDK::FHitResult hit{};
 			if (cdo != nullptr && cdo->Mesh != nullptr)
 				mesh->K2_SetRelativeLocationAndRotation(cdo->Mesh->RelativeLocation, cdo->Mesh->RelativeRotation, false, &hit, true);
@@ -2041,6 +2282,14 @@ namespace
 			g_standInPlaced = {};
 			g_standIn.ref = {w, w->Index};
 			g_standIn.since = GetTickCount64();
+			g_standIn.meshParent = w->Mesh != nullptr ? w->Mesh->AttachParent : nullptr;
+			g_standIn.meshParentKnown = w->Mesh != nullptr;
+			if (w->Mesh != nullptr)
+				g_standIn.bodyResponse = w->Mesh->GetCollisionResponseToChannel(static_cast<SDK::ECollisionChannel>(16));
+			hslog::info("stand-in's body as Half Sword had it: hanging from %s, other bodies %s, simulating %d",
+				w->Mesh == nullptr ? "-" : w->Mesh->AttachParent == nullptr ? "nothing" : w->Mesh->AttachParent == w->CapsuleComponent ? "the capsule" : "something else",
+				g_standIn.bodyResponse == SDK::ECollisionResponse::ECR_Block ? "block" : g_standIn.bodyResponse == SDK::ECollisionResponse::ECR_Overlap ? "overlap" : "ignored",
+				w->Mesh != nullptr ? int(w->Mesh->IsSimulatingPhysics(name(L"pelvis"))) : -1);
 			g_standIn.health = w->Health;
 			g_standIn.consciousness = w->Consciousness;
 			g_standIn.stamina = w->Stamina;
@@ -2072,6 +2321,9 @@ namespace
 			if (w->CharacterMovement != nullptr)
 				w->CharacterMovement->DisableMovement();
 			g_standIn.hidden = true;
+			g_restorePending = false; // (Steve again before its physics came back: it stays pinned)
+			restore_joints();
+			g_restored = {};
 		}
 		// Steve's health is Minecraft's: the stand-in's hit events never reach Half Sword (the filter), the fighters'
 		// weapons and fists on it go to Minecraft as they land
@@ -2986,6 +3238,8 @@ namespace
 			input::share_continue_key(false);
 			g_blocks.clear(); // (the boxes went with the old world)
 			g_riders.clear(); // (and the riders' planks, the riders)
+			g_savedJoints.clear(); // (the given-back body went too)
+			g_savedJointsMesh = {};
 			g_unrideUntil.clear();
 			g_blockActor = {};
 			g_burning.clear();
@@ -3015,6 +3269,7 @@ namespace
 			release_riders("passthrough off");
 			release_camera(pc, pc->Pawn);
 			restore_stand_in();
+			settle_restored();
 			input::route_to_minecraft(false);
 			g_halfSwordMenu = g_menuSeen = false; // (on again: Minecraft's input, whatever Escape did meanwhile)
 			set_frame_cap(world, pc, g_cfg.fps); // (menus: the player's own cap)
@@ -3092,7 +3347,38 @@ namespace
 		}
 		else if (relevel && g_steve.valid)
 			level_at(world, to_ue(g_steve.x, g_steve.y, g_steve.z));
-		if (g_tpIn >= 0 && --g_tpIn < 0)
+		// Steve goes to the start once the ground there has streamed in: the columns around it scanned and sent (put
+		// there before, he fell into the gap and the ground then appeared around him - he spawned inside it). At most
+		// ~5 s of waiting.
+		static int tpWaited = 0;
+		bool tpNow = false;
+		if (g_tpIn > 0)
+		{
+			--g_tpIn;
+			tpWaited = 0;
+		}
+		else if (g_tpIn == 0)
+		{
+			double sx, sy, sz;
+			to_mc(g_startFeet, sx, sy, sz);
+			const int bx = int(std::floor(sx)), by = int(std::floor(sy)), bz = int(std::floor(sz));
+			bool ready = true;
+			for (int dx = -2; dx <= 2 && ready; ++dx)
+				for (int dz = -2; dz <= 2 && ready; ++dz)
+				{
+					// scanned for the start's height (a scan around somewhere else leaves the start's floor out)
+					auto col = g_scanned.find(column_key(bx + dx, bz + dz));
+					ready = col != g_scanned.end() && std::abs(col->second.refY - by) < kRescanCells;
+				}
+			if (ready || ++tpWaited > 300)
+			{
+				if (!ready)
+					hslog::info("the ground around the start still isn't all scanned: Steve goes there anyway");
+				g_tpIn = -1;
+				tpNow = true;
+			}
+		}
+		if (tpNow)
 		{
 			double x, y, z;
 			to_mc(g_startFeet, x, y, z);
@@ -3169,10 +3455,12 @@ namespace
 			compositor::set_host_planes(engine != nullptr ? engine->NearClipPlane / 100.0f : 0.001f, 1.0e7f);
 		}
 
-		if (g_steve.valid)
-			sample_ground(world, to_ue(g_steve.x, g_steve.y, g_steve.z));
-		else if (g_tpIn >= 0)
+		// until Steve is at the start, the ground around the start (wherever he is meanwhile: in the void, as the old
+		// ground went - scanned around him, the start's floor was out of the window and he arrived to no collision)
+		if (g_tpIn >= 0)
 			sample_ground(world, g_startFeet);
+		else if (g_steve.valid)
+			sample_ground(world, to_ue(g_steve.x, g_steve.y, g_steve.z));
 
 
 		std::string message;
@@ -3198,7 +3486,9 @@ namespace bridge
 	{
 		if (block_script(object, function, parms))
 			return true;
-		if ((g_standInObj == nullptr && g_mobBodyOf.empty()) || parms == nullptr)
+		const bool settling = object != nullptr && object == g_restored.obj && g_restored.alive() &&
+			(g_restorePending || GetTickCount64() - g_restoredAt <= kRestoreSettleMs);
+		if ((g_standInObj == nullptr && g_mobBodyOf.empty() && !settling) || parms == nullptr)
 			return false;
 		const HitEvent *e = nullptr;
 		for (const HitEvent &h : g_hitEvents)
@@ -3206,6 +3496,18 @@ namespace bridge
 				e = &h;
 		if (e == nullptr)
 			return false;
+		// the body just given back feels nothing of its own while it settles (it landing on the ground put its back
+		// out, 0.3 s in): only its own hits, a fighter's blow on it still lands
+		if (settling)
+		{
+			static ULONGLONG said = 0;
+			if (GetTickCount64() - said > 500)
+			{
+				said = GetTickCount64();
+				hslog::info("the body given back: its own hit ignored while it settles, %llu ms in", GetTickCount64() - g_restoredAt);
+			}
+			return true;
+		}
 		if ((g_standInObj != nullptr && object == g_standInObj) || g_mobBodyOf.count(static_cast<const SDK::UObject *>(object)))
 			return true; // the stand-in and the mobs' bodies feel nothing themselves: the floor, a landing, a weapon touching them
 		auto *p = static_cast<HitParms *>(parms);
@@ -3459,6 +3761,35 @@ namespace bridge
 		return true;
 	}
 
+	/// The body just given back (restore_stand_in), its first moments: Half Sword breaking its bones then is the
+	/// physics coming back on, not a blow - Break_Leg_L/R (it was always a leg), arms, back, head, Snap_Neck are skipped,
+	/// and so is Half Sword's own joint check (Event Check Bone Dislocation Status: it put both legs out 94-125 ms in,
+	/// with every joint unbreakable).
+	bool block_restore_break(const void *context, const void *function)
+	{
+		if (context != g_restored.obj || !g_restored.alive() || (!g_restorePending && GetTickCount64() - g_restoredAt > kRestoreSettleMs))
+			return false;
+		static std::unordered_map<const void *, std::string> breaks; // function -> its name if it breaks a bone, else ""
+		auto it = breaks.find(function);
+		if (it == breaks.end())
+		{
+			std::string n = static_cast<const SDK::UObject *>(function)->GetName(), low;
+			for (char ch : n)
+				if (std::isalnum(static_cast<unsigned char>(ch)))
+					low += char(std::tolower(static_cast<unsigned char>(ch)));
+			static const char *kBreaks[] = {"breaklegl", "breaklegr", "breakarml", "breakarmr", "breakback", "breakhead", "snapneck",
+				"eventcheckbonedislocationstatus"};
+			bool found = false;
+			for (const char *b : kBreaks)
+				found = found || low == b;
+			it = breaks.emplace(function, found ? n : std::string()).first;
+		}
+		if (it->second.empty())
+			return false;
+		hslog::info("the body given back would run %s %llu ms in: skipped", it->second.c_str(), GetTickCount64() - g_restoredAt);
+		return true;
+	}
+
 	bool block_script(const void *context, const void *function, const void *parms)
 	{
 		if (context != nullptr && function != nullptr)
@@ -3466,6 +3797,8 @@ namespace bridge
 		if (context != nullptr && function != nullptr && block_mob_minus_enemy(context, function))
 			return true;
 		if (context != nullptr && function != nullptr && block_map_trigger(context, function, parms))
+			return true;
+		if (context != nullptr && function != nullptr && block_restore_break(context, function))
 			return true;
 		if (context != nullptr && function != nullptr && context != g_standInObj && g_standInObj != nullptr)
 			watch_fight_end(context, function);

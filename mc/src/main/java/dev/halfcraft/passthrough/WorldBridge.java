@@ -123,6 +123,7 @@ public final class WorldBridge {
 		}
 
 		s.execute(() -> {
+			startHold(s);
 			ServerLevel level = s.overworld();
 			placingGround = true;
 			for (BlockPos pos : barriers) {
@@ -312,7 +313,66 @@ public final class WorldBridge {
 		s.execute(() -> {
 			Passthrough.LOG.info("command: {}", command);
 			s.getCommands().performPrefixedCommand(s.createCommandSourceStack(), command);
+			if (command.startsWith("tp @a")) {
+				endHold(s, "put at the start"); // (the host's ground is there now)
+			}
 		});
+	}
+
+	/** Ticks left holding the player while the host's ground streams in (0: not holding). */
+	private static int holdTicks;
+	private static final int HOLD_MAX_TICKS = 400;
+
+	/**
+	 * The host's ground was cleared (a new fight, a new map): until the host puts the player at the start, he hovers
+	 * where he is. He used to fall through the void meanwhile, and land at the start with all that fall in him (dead).
+	 * Server thread.
+	 */
+	private static void startHold(final MinecraftServer s) {
+		if (s.getPlayerList().getPlayers().isEmpty()) {
+			return;
+		}
+
+		holdTicks = HOLD_MAX_TICKS;
+		Passthrough.LOG.info("holding the player until the host's ground is in");
+	}
+
+	private static void endHold(final MinecraftServer s, final String why) {
+		if (holdTicks <= 0) {
+			return;
+		}
+
+		holdTicks = 0;
+		for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+			p.resetFallDistance();
+			p.gameMode.getGameModeForPlayer().updatePlayerAbilities(p.getAbilities()); // (flying as its game mode has it)
+			p.getAbilities().flying = p.getAbilities().flying && p.getAbilities().mayfly;
+			p.onUpdateAbilities();
+		}
+
+		Passthrough.LOG.info("player let go: {}", why);
+	}
+
+	/** Each tick while holding: hovering, no fall building up (game mode commands reset flight: set again). */
+	private static void hold(final MinecraftServer s) {
+		if (holdTicks <= 0) {
+			return;
+		}
+
+		if (--holdTicks == 0) {
+			holdTicks = 1;
+			endHold(s, "the host never put him at the start");
+			return;
+		}
+
+		for (ServerPlayer p : s.getPlayerList().getPlayers()) {
+			p.resetFallDistance();
+			if (!p.getAbilities().flying || !p.getAbilities().mayfly) {
+				p.getAbilities().mayfly = true;
+				p.getAbilities().flying = true;
+				p.onUpdateAbilities();
+			}
+		}
 	}
 
 	private static boolean solidForHost(final ServerLevel level, final BlockPos pos, final BlockState state) {
@@ -326,6 +386,7 @@ public final class WorldBridge {
 	/** Every server tick: block changes, and projectiles in flight for the host to trace through its own world. */
 	static void tick(final MinecraftServer s) {
 		flush(s);
+		hold(s);
 		if (++reportTicks >= 100) {
 			reportTicks = 0;
 			if (barriersPlaced > 0 || barriersRemoved > 0) {
@@ -339,6 +400,7 @@ public final class WorldBridge {
 		}
 		if (Passthrough.active) {
 			reportProjectiles(s.overworld());
+			s.getPlayerList().getPlayers().forEach(HostGround::unstuck);
 		}
 
 		MobWar.tick(s);

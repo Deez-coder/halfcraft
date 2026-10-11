@@ -17,6 +17,7 @@ i added as much as i can. this includes but is not limited to:
 works with half sword early access 0.6.1.5 and minecraft 26.3 (fabric).
 if half sword updates it will probably break until i update it too.
 both games run at once, so you need a decent pc.
+known issue: switching back to your half sword fighter with F9 can glitch his body (legs or back get dislocated) and sometimes kills him. a fix is being worked on.
 the mob and player movement system is based on  tiny voxels that are generated and sent to minecraft's collision system, same for blocks. blocks that depend on a block existing near it like torches,redstone use a barrier system that generates around the map. its not the best but it works if you want to directly place any block dependant block directly on halfsword ground.
 ## how to install
 

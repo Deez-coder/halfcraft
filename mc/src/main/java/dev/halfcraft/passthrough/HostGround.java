@@ -93,6 +93,56 @@ public final class HostGround {
 		return CELLS.isEmpty() ? null : CELLS.get(pos.asLong());
 	}
 
+	/** Ticks the player has been inside the host's ground in a row. */
+	private static int stuckTicks;
+
+	/**
+	 * Server tick: a player inside the host's ground (put there before it streamed in, or it was scanned anew around
+	 * him) is lifted to the nearest free spot above, up to 3 blocks. Movement can't take him out: collision only
+	 * keeps things from going in.
+	 */
+	public static void unstuck(final net.minecraft.server.level.ServerPlayer player) {
+		if (CELLS.isEmpty() || player.isSpectator() || player.isPassenger() || player.isSleeping() || player.level().dimension() != net.minecraft.world.level.Level.OVERWORLD) {
+			stuckTicks = 0;
+			return;
+		}
+
+		net.minecraft.world.phys.AABB box = player.getBoundingBox().deflate(0.02);
+		if (!insideGround(box)) {
+			stuckTicks = 0;
+			return;
+		}
+
+		if (++stuckTicks < 3) {
+			return;
+		}
+
+		stuckTicks = 0;
+		for (double up = 0.125; up <= 3.0; up += 0.125) {
+			net.minecraft.world.phys.AABB moved = box.move(0.0, up, 0.0);
+			if (!insideGround(moved) && player.level().noCollision(player, moved)) {
+				Passthrough.LOG.info("player was inside the host's ground at {}: lifted {} blocks", player.position(), up);
+				player.teleportTo(player.getX(), player.getY() + up + 0.02, player.getZ());
+				return;
+			}
+		}
+	}
+
+	private static boolean insideGround(final net.minecraft.world.phys.AABB box) {
+		for (BlockPos pos : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY, box.minZ), BlockPos.containing(box.maxX, box.maxY, box.maxZ))) {
+			Cell cell = cellAt(pos);
+			if (cell != null) {
+				for (net.minecraft.world.phys.AABB a : cell.shape().move(pos).toAabbs()) {
+					if (a.intersects(box)) {
+						return true;
+					}
+				}
+			}
+		}
+
+		return false;
+	}
+
 	public static int shapes() {
 		return CELLS.size();
 	}
