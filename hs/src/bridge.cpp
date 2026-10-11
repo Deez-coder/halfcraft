@@ -88,6 +88,7 @@ namespace
 		double part[kParts] = {1, 1, 1, 1, 1};
 		int fps = 0; // Half Sword's frame cap (/hs fps, 0 = none): what it leaves of the GPU, Minecraft gets
 		bool balance = true; // cap Half Sword a little above Minecraft's rate (Minecraft does the same the other way)
+		double props = 1.0;  // how hard Steve's blows push loose things (/hs props)
 	} g_cfg;
 	int g_fpsApplied = 0;
 	// Minecraft's frame rate, from the export's publish counter (for the balance)
@@ -443,6 +444,8 @@ namespace
 	constexpr double kSubHalf = 6.25; // half a 1/8-block sub-column (cm)
 	constexpr double kClearCm = 3.0;  // a follow-up trace starts this far from the surface it found (the box is 2 cm tall)
 
+	std::string *g_groundWhy = nullptr; // /hs ground: what the traces hit, for the log
+
 	struct TraceHit
 	{
 		double z = 0.0;
@@ -465,9 +468,24 @@ namespace
 			: SDK::UKismetSystemLibrary::LineTraceSingleForObjects(world, from, to, typeArray, false, ignore, SDK::EDrawDebugTrace::None, &hit, true,
 				  SDK::FLinearColor{}, SDK::FLinearColor{}, 0.0f);
 		if (!ok || !hit.bBlockingHit)
+		{
+			if (g_groundWhy != nullptr)
+				*g_groundWhy += "    trace " + std::to_string(int(from.Z)) + (to.Z < from.Z ? " down" : " up") + ": nothing\n";
 			return false;
+		}
 		out.z = hit.ImpactPoint.Z;
 		out.inside = hit.bStartPenetrating || hit.Distance < 0.5f;
+		if (g_groundWhy != nullptr)
+		{
+			SDK::UPrimitiveComponent *c = hit.Component.Get();
+			SDK::AActor *a = c != nullptr ? c->GetOwner() : nullptr;
+			char line[512];
+			snprintf(line, sizeof(line), "    trace %d %s: hit z %.0f%s %s / %s (blocks bodies %d, pawns %d)\n", int(from.Z), to.Z < from.Z ? "down" : "up", out.z,
+				out.inside ? " INSIDE" : "", a != nullptr ? a->GetName().c_str() : "?", c != nullptr ? c->GetName().c_str() : "?",
+				c != nullptr ? int(c->GetCollisionResponseToChannel(SDK::ECollisionChannel::ECC_PhysicsBody)) : -1,
+				c != nullptr ? int(c->GetCollisionResponseToChannel(SDK::ECollisionChannel::ECC_Pawn)) : -1);
+			*g_groundWhy += line;
+		}
 		if (out.inside)
 		{
 			out.insideBottom = from.Z - 50.0;
@@ -498,7 +516,7 @@ namespace
 	constexpr int kCellsAbove = 12;           // and above
 	constexpr int kRescanCells = 3;           // Steve this many cells up or down from a column's scan: scan it again
 	constexpr double kScanBudgetMs = 2.0;     // tracing per tick
-	constexpr int kMaxTraces = 12;            // per sub-column
+	constexpr int kMaxTraces = 24;            // per sub-column
 	constexpr double kMergeGapCm = 60.0;      // a gap under a floor thinner than this is closed (nothing fits in it)
 	constexpr int kNearlyWholeLow = 426;      // of a cell's 448 1/8 cubes in its bottom 7 layers: counts as a whole cell
 	constexpr int kSupportLayers = 4;         // a ground surface cell this many 1/8 layers up (median) gets a support barrier
@@ -599,7 +617,7 @@ namespace
 	/// would otherwise leave no whole cell under it, so no barrier - Minecraft's water, torches and redstone need one).
 	/// Gaps too thin for anything to get into (a floor piece lying just over the ground under it) are closed: they'd
 	/// leave the cell under the floor short of whole.
-	void finish_stretches(std::vector<std::pair<double, double>> &out, double zBot)
+	void finish_stretches(std::vector<std::pair<double, double>> &out, double zBot, bool solidDown = true)
 	{
 		for (size_t i = 0; i + 1 < out.size();)
 			if (out[i].first - out[i + 1].second < kMergeGapCm)
@@ -609,8 +627,57 @@ namespace
 			}
 			else
 				++i;
-		if (!out.empty())
+		if (!out.empty() && solidDown)
 			out.back().first = zBot;
+	}
+
+	/// Whether (x, y, z) is inside something static: a tiny box swept 1 cm down from there starts in it.
+	bool inside_static(SDK::UWorld *world, double x, double y, double z)
+	{
+		std::string *why = g_groundWhy;
+		g_groundWhy = nullptr; // (the probes aren't worth a log line each)
+		TraceHit t;
+		const bool in = trace_static(world, SDK::FVector(x, y, z), SDK::FVector(x, y, z - 1.0), t, 1.0) && t.inside;
+		g_groundWhy = why;
+		return in;
+	}
+
+	/// The bottom of the solid that (x, y, from) is in, no lower than `limit` (the shape's bounds). Probed: one mesh's
+	/// bounds can reach far below it at this spot (a vaulted roof's go down to where its arches meet the walls: taking
+	/// them made the air under the Cellar's roof solid). Steps doubling down to the first point outside, then halved
+	/// to within 1/16 block.
+	double inside_bottom(SDK::UWorld *world, double x, double y, double from, double limit)
+	{
+		double in = from, out = limit;
+		bool found = false;
+		for (double step = 12.5; from - step > limit; step *= 2.0)
+		{
+			if (!inside_static(world, x, y, from - step))
+			{
+				out = from - step;
+				found = true;
+				break;
+			}
+			in = from - step;
+		}
+		if (!found)
+		{
+			if (inside_static(world, x, y, limit + 0.5))
+				return limit;
+			out = limit;
+		}
+		while (in - out > 6.25)
+		{
+			const double mid = (in + out) / 2.0;
+			if (inside_static(world, x, y, mid))
+				in = mid;
+			else
+				out = mid;
+		}
+		if (g_groundWhy != nullptr)
+			*g_groundWhy += "    inside from " + std::to_string(int(from)) + ": solid down to " + std::to_string(int((in + out) / 2.0)) + " (bounds say " +
+				std::to_string(int(limit)) + ")\n";
+		return (in + out) / 2.0;
 	}
 
 	void solid_stretches(SDK::UWorld *world, double ux, double uy, double zTop, double zBot, std::vector<std::pair<double, double>> &out)
@@ -631,8 +698,8 @@ namespace
 			}
 			if (h.inside)
 			{
-				// in a box or convex shape: solid down to its bottom
-				const double bottom = std::max(std::min(h.insideBottom, from - 12.5), zBot);
+				// in a box or convex shape: solid down to its bottom here (probed: not its bounds' bottom)
+				const double bottom = std::max(std::min(inside_bottom(world, ux, uy, from, std::max(h.insideBottom, zBot)), from - 12.5), zBot);
 				if (haveOpen)
 					out.emplace_back(bottom, open), haveOpen = false;
 				else if (!out.empty() && out.back().first <= from + 2.0)
@@ -663,7 +730,18 @@ namespace
 		}
 		if (haveOpen)
 			out.emplace_back(std::max(zBot, open - kOpenThinCm), open);
-		finish_stretches(out, zBot);
+		// out of traces before the bottom (many floors over this one: a cellar under a building): what's under the last
+		// surface found isn't known, so it isn't filled in (that filled whole rooms)
+		finish_stretches(out, zBot, from <= zBot);
+		if (from > zBot)
+		{
+			static int logged = 0;
+			if (logged < 5)
+			{
+				++logged;
+				hslog::info("ground: out of traces at %.0f, %.0f (stopped at z %.0f of %.0f)", ux, uy, from, zBot);
+			}
+		}
 	}
 
 	/// One Minecraft block column: its cells from Steve's - kCellsBelow to + kCellsAbove, sent where they changed.
@@ -1693,6 +1771,7 @@ namespace
 			g_cfg.part[p] = json_num(m, kPartNames[p], 1.0);
 		g_cfg.fps = int(json_num(m, "fps", 0.0));
 		g_cfg.balance = json_num(m, "balance", 1.0) != 0.0;
+		g_cfg.props = json_num(m, "props", 1.0);
 		hslog::info("damage settings: dealt x%.2f taken x%.2f potions x%.2f head %.2f neck %.2f torso %.2f arms %.2f legs %.2f", g_cfg.dealt, g_cfg.taken, g_cfg.potions,
 			g_cfg.part[kHead], g_cfg.part[kNeck], g_cfg.part[kTorso], g_cfg.part[kArms], g_cfg.part[kLegs]);
 	}
@@ -1958,6 +2037,71 @@ namespace
 		g_fightersRefresh = 0; // hidden: found by the next scan
 	}
 
+	// ---- night vision: Minecraft's, on Steve, lights Half Sword's own picture: more exposure on our camera, the
+	// shadows lifted and the highlights held back (Half Sword's local exposure), so the dark shows its detail ----
+	float g_nightVision = 0.0f; // 0..1 ("me": Minecraft's own strength, flickering as it runs out)
+	bool g_nightVisionOn = false;
+	struct MapExposure
+	{
+		bool known = false;
+		float bias = 1.0f, shadows = 1.0f, highlights = 1.0f; // the map's own (its strongest unbound volume's)
+	} g_mapExposure;
+
+	MapExposure map_exposure(SDK::UWorld *world)
+	{
+		MapExposure e;
+		e.known = true;
+		SDK::TArray<SDK::AActor *> found;
+		SDK::UGameplayStatics::GetAllActorsOfClass(world, SDK::APostProcessVolume::StaticClass(), &found);
+		const SDK::APostProcessVolume *best = nullptr;
+		for (int i = 0; i < found.Num(); ++i)
+		{
+			const auto *v = static_cast<const SDK::APostProcessVolume *>(found[i]);
+			if (v != nullptr && v->bEnabled && v->bUnbound && (best == nullptr || v->Priority > best->Priority))
+				best = v;
+		}
+		if (best != nullptr)
+		{
+			const SDK::FPostProcessSettings &s = best->Settings;
+			if (s.bOverride_AutoExposureBias)
+				e.bias = s.AutoExposureBias;
+			if (s.bOverride_LocalExposureShadowContrastScale)
+				e.shadows = s.LocalExposureShadowContrastScale;
+			if (s.bOverride_LocalExposureHighlightContrastScale)
+				e.highlights = s.LocalExposureHighlightContrastScale;
+		}
+		hslog::info("night vision: the map's exposure %.2f, shadows %.2f, highlights %.2f (%d volumes)", e.bias, e.shadows, e.highlights, found.Num());
+		return e;
+	}
+
+	void apply_night_vision(SDK::UWorld *world, SDK::ACameraActor *cam)
+	{
+		if (cam->CameraComponent == nullptr)
+			return;
+		SDK::FPostProcessSettings &s = cam->CameraComponent->PostProcessSettings;
+		const float nv = std::clamp(g_nightVision, 0.0f, 1.0f);
+		if (nv <= 0.0f)
+		{
+			if (g_nightVisionOn)
+			{
+				s.bOverride_AutoExposureBias = 0;
+				s.bOverride_LocalExposureShadowContrastScale = 0;
+				s.bOverride_LocalExposureHighlightContrastScale = 0;
+				g_nightVisionOn = false;
+			}
+			return;
+		}
+		if (!g_mapExposure.known)
+			g_mapExposure = map_exposure(world);
+		s.bOverride_AutoExposureBias = 1;
+		s.AutoExposureBias = g_mapExposure.bias + 2.5f * nv;
+		s.bOverride_LocalExposureShadowContrastScale = 1;
+		s.LocalExposureShadowContrastScale = std::min(g_mapExposure.shadows, g_mapExposure.shadows + (0.3f - g_mapExposure.shadows) * nv);
+		s.bOverride_LocalExposureHighlightContrastScale = 1;
+		s.LocalExposureHighlightContrastScale = std::min(g_mapExposure.highlights, g_mapExposure.highlights + (0.45f - g_mapExposure.highlights) * nv);
+		g_nightVisionOn = true;
+	}
+
 	/// Half Sword looks through a camera of ours, placed where Minecraft's camera is: as the view target (for the
 	/// next camera update) and written straight into this frame's camera cache, which the renderer reads after us.
 	void apply_camera(SDK::UWorld *world, SDK::APlayerController *pc, SDK::APlayerCameraManager *cm)
@@ -1974,6 +2118,8 @@ namespace
 				return;
 			SDK::UGameplayStatics::FinishSpawningActor(a, t, SDK::ESpawnActorScaleMethod::MultiplyWithRoot);
 			g_camera = {a, a->Index};
+			g_mapExposure = {}; // (a new camera: a new map, maybe)
+			g_nightVisionOn = false;
 			hslog::info("camera actor %s", a->GetName().c_str());
 		}
 		auto *cam = static_cast<SDK::ACameraActor *>(g_camera.obj);
@@ -1981,6 +2127,7 @@ namespace
 		cam->K2_SetActorLocationAndRotation(g_camLoc, g_camRot, false, &hit, true);
 		if (cam->CameraComponent != nullptr)
 			cam->CameraComponent->SetFieldOfView(g_camFov);
+		apply_night_vision(world, cam);
 		if (cm->ViewTarget.Target != cam)
 			pc->SetViewTargetWithBlend(cam, 0.0f, SDK::EViewTargetBlendFunction::VTBlend_Linear, 0.0f, false);
 	}
@@ -3030,6 +3177,89 @@ namespace
 		}
 	}
 
+	/// /hs ground: how the ground scan sees Steve's column (its middle line): every trace and what it hit, the solid
+	/// stretches that make, and what Minecraft has in each cell (# barrier, p partial, s partial with a support barrier).
+	void ground_why(SDK::UWorld *world)
+	{
+		if (!g_steve.valid || !g_haveOffset)
+			return;
+		const int x = int(std::floor(g_steve.x)), z = int(std::floor(g_steve.z)), refY = int(std::floor(g_steve.y));
+		const double zTop = (refY - g_yOffset) * 100.0 + kScanFromAbove, zBot = (refY - kCellsBelow - 2 - g_yOffset) * 100.0;
+		std::string why;
+		g_groundWhy = &why;
+		std::vector<std::pair<double, double>> st;
+		solid_stretches(world, (x + 0.5) * 100.0, (z + 0.5) * 100.0, zTop, zBot, st);
+		g_groundWhy = nullptr;
+		why += "  solid, in Minecraft heights:";
+		for (const auto &[lo, hi] : st)
+		{
+			char r[64];
+			snprintf(r, sizeof(r), " %.2f..%.2f", lo / 100.0 + g_yOffset, hi / 100.0 + g_yOffset);
+			why += r;
+		}
+		why += "\n  cells from y " + std::to_string(refY + kCellsAbove) + " down:";
+		for (int y = refY + kCellsAbove; y >= refY - kCellsBelow; --y)
+		{
+			auto it = g_sentCells.find(cell_key(x, y, z));
+			why += it == g_sentCells.end() ? " ." : it->second == 1 ? " #" : " p";
+			if (y == refY)
+				why += "(Steve)";
+		}
+		hslog::info("ground at %d %d %d (Steve's column, its middle; scan from %.0f down to %.0f cm):", x, refY, z, zTop, zBot);
+		for (size_t a = 0, b; a < why.size(); a = b + 1)
+		{
+			b = why.find('\n', a);
+			if (b == std::string::npos)
+				b = why.size();
+			if (b > a)
+				hslog::info("%s", why.substr(a, b - a).c_str());
+		}
+	}
+
+	// ---- Steve's blows on Half Sword's loose things ----
+	constexpr double kPropImpulse = 4000.0; // kg cm/s a full blow gives (a 10 kg candle stand: 4 m/s)
+	constexpr double kPropMaxSpeed = 1200.0; // cm/s, the most a full blow gives something light (a weapon, a chain link)
+
+	/// {"t":"swing","o":[eyes],"d":[look],"r":reach,"s":charge}: Steve swung at no mob or fighter. The first thing on that
+	/// line, as far as he reaches: if it's loose (simulating physics: a candle stand, a chain, a weapon on the floor, not a
+	/// fighter), it's pushed the way he swung, at the point he hit, as Minecraft knocks things back (a little up too),
+	/// charged as his blow was. Walls and Minecraft's own blocks stop the blow.
+	void on_swing(SDK::UWorld *world, const std::string &m)
+	{
+		double o[3], d[3];
+		if (g_cfg.props <= 0.0 || json_nums(m, "o", o, 3) != 3 || json_nums(m, "d", d, 3) != 3)
+			return;
+		const double reach = json_num(m, "r", 3.5) * 100.0, charge = std::clamp(json_num(m, "s", 1.0), 0.0, 1.0);
+		const SDK::FVector from = to_ue(o[0], o[1], o[2]);
+		SDK::FVector dir(d[0], d[2], d[1]);
+		const double len = std::sqrt(dir.X * dir.X + dir.Y * dir.Y + dir.Z * dir.Z);
+		if (len < 1e-6)
+			return;
+		dir = SDK::FVector(dir.X / len, dir.Y / len, dir.Z / len);
+		const SDK::FVector to(from.X + dir.X * reach, from.Y + dir.Y * reach, from.Z + dir.Z * reach);
+		SDK::EObjectTypeQuery types[] = {SDK::EObjectTypeQuery::ObjectTypeQuery1, SDK::EObjectTypeQuery::ObjectTypeQuery2,
+			SDK::EObjectTypeQuery::ObjectTypeQuery4, SDK::EObjectTypeQuery::ObjectTypeQuery6}; // static, dynamic, physics bodies, destructibles
+		SDK::TArray<SDK::EObjectTypeQuery> typeArray(types, 4, 4);
+		SDK::AActor *skip[1] = {g_standIn.ref.alive() ? static_cast<SDK::AActor *>(g_standIn.ref.obj) : nullptr};
+		SDK::TArray<SDK::AActor *> ignore(skip, skip[0] != nullptr ? 1 : 0, 1);
+		SDK::FHitResult hit{};
+		if (!SDK::UKismetSystemLibrary::SphereTraceSingleForObjects(world, from, to, 8.0f, typeArray, false, ignore, SDK::EDrawDebugTrace::None, &hit, true,
+				SDK::FLinearColor{}, SDK::FLinearColor{}, 0.0f) || !hit.bBlockingHit)
+			return;
+		SDK::UPrimitiveComponent *c = hit.Component.Get();
+		SDK::AActor *owner = c != nullptr ? c->GetOwner() : nullptr;
+		if (c == nullptr || as_willie(owner) != nullptr || !c->IsSimulatingPhysics(hit.BoneName))
+			return; // a wall, a block, the floor, a fighter (his hits go through his proxy)
+		const double mass = std::max(double(c->GetMass()), 0.2);
+		const double k = g_cfg.props * (0.2 + 0.8 * charge * charge); // Minecraft's own: an uncharged blow is a fifth
+		const double speed = std::min(kPropImpulse * k / mass, kPropMaxSpeed * k);
+		SDK::FVector push(dir.X, dir.Y, dir.Z + 0.15);
+		const double plen = std::sqrt(push.X * push.X + push.Y * push.Y + push.Z * push.Z);
+		push = SDK::FVector(push.X / plen * speed * mass, push.Y / plen * speed * mass, push.Z / plen * speed * mass);
+		c->AddImpulseAtLocation(push, hit.ImpactPoint, hit.BoneName);
+		hslog::info("swing: pushed %s (%s, %.1f kg) at %.0f cm/s", owner != nullptr ? owner->GetName().c_str() : "?", c->GetName().c_str(), mass, speed);
+	}
+
 	// ---- messages from Minecraft ----
 	void handle_event(SDK::UWorld *world, const std::string &m)
 	{
@@ -3047,6 +3277,7 @@ namespace
 				g_steve.valid = true;
 			}
 			g_mcScreen = json_bool(m, "scr");
+			g_nightVision = float(json_num(m, "nv"));
 		}
 		else if (t == "hit")
 			on_hit(m);
@@ -3072,6 +3303,10 @@ namespace
 			on_ride(m);
 		else if (t == "seats")
 			on_seats(m);
+		else if (t == "swing")
+			on_swing(world, m);
+		else if (t == "groundwhy")
+			ground_why(world);
 		else if (t == "resample")
 		{
 			reset_ground(); // Minecraft lost some of the ground (or cleaned up): send it all again

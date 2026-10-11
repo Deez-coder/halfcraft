@@ -20,7 +20,8 @@
 		"ServerExplosionMixin",
 		"ServerPlayerMixin",
 		"VillagerMixin",
-		"WalkNodeEvaluatorMixin"
+		"WalkNodeEvaluatorMixin",
+		"WardenMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

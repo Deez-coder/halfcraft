@@ -62,6 +62,25 @@ public final class OwnMode {
 		}
 	}
 
+	private static long lastSwing;
+
+	/**
+	 * Steve swings (client, Minecraft.startAttack): {"t":"swing","o":[eyes],"d":[look],"r":reach,"s":charge}. The host
+	 * pushes the first of its loose things on that line (/hs props sets how hard).
+	 */
+	public static void swing(final LocalPlayer player) {
+		long now = System.currentTimeMillis();
+		if (now - lastSwing < 120L) {
+			return; // (one blow, however many clicks it took)
+		}
+
+		lastSwing = now;
+		Vec3 eye = player.getEyePosition();
+		Vec3 look = player.getViewVector(1.0F);
+		Passthrough.events.accept(String.format(Locale.ROOT, "{\"t\":\"swing\",\"o\":[%.4f,%.4f,%.4f],\"d\":[%.4f,%.4f,%.4f],\"r\":%.2f,\"s\":%.2f}",
+			eye.x, eye.y, eye.z, look.x, look.y, look.z, player.entityInteractionRange() + 0.5, player.getAttackStrengthScale(0.5F)));
+	}
+
 	/** Render thread, end of the camera update: keep the mouse grabbed for play, and tell the host where the player is. */
 	public static void frame(final float partialTick) {
 		Minecraft minecraft = Minecraft.getInstance();
@@ -75,10 +94,13 @@ public final class OwnMode {
 		}
 
 		Vec3 at = player.getPosition(partialTick);
+		// night vision lights Half Sword's picture too (0..1, Minecraft's own: it flickers as it runs out)
+		float nv = player.hasEffect(net.minecraft.world.effect.MobEffects.NIGHT_VISION)
+			? net.minecraft.client.renderer.GameRenderer.nightVisionScale(player, partialTick) : 0.0F;
 		Passthrough.events.accept(String.format(Locale.ROOT,
-			"{\"t\":\"me\",\"p\":[%.4f,%.4f,%.4f],\"y\":%.2f,\"hp\":%.2f,\"max\":%.2f,\"scr\":%b,\"dead\":%b,\"sneak\":%b}",
+			"{\"t\":\"me\",\"p\":[%.4f,%.4f,%.4f],\"y\":%.2f,\"hp\":%.2f,\"max\":%.2f,\"scr\":%b,\"dead\":%b,\"sneak\":%b,\"nv\":%.3f}",
 			at.x, at.y, at.z, player.getYRot(), player.getHealth(), player.getMaxHealth(), minecraft.gui.screen() != null,
-			player.isDeadOrDying(), player.isShiftKeyDown()));
+			player.isDeadOrDying(), player.isShiftKeyDown(), nv));
 		// fighters in boats and carts: their seats where the vehicles are drawn this frame
 		// ({"t":"seats","s":[[handle, x, vehicle y, z],...]})
 		java.util.Map<Integer, double[]> riders = dev.halfcraft.passthrough.MobWar.riders;

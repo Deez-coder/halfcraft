@@ -36,6 +36,7 @@ import net.minecraft.network.chat.Component;
  * <li>/hs kit save|give|reset|auto on|off: your inventory as the kit you get at the start of every Half Sword fight</li>
  * <li>/hs hostile on|off: neutral mobs (wolves, golems, bees, endermen...) attack the fighters and Steve on sight</li>
  * <li>/hs balance on|off: each game no faster than a little above the other (the GPU goes to frames that are shown)</li>
+ * <li>/hs props &lt;x&gt;: how hard Steve's hits push Half Sword's loose things (candle stands, chains, weapons)</li>
  * <li>/hs export sync|async: hand Minecraft's frames over as soon as the GPU has them (sync), or Minecraft's own way</li>
  * </ul>
  * The host applies dealt/taken/part (it knows where a hit lands); weapon multipliers apply here, to the hit's damage.
@@ -49,6 +50,7 @@ public final class HsConfig {
 		double dealt = 1.0;
 		double taken = 1.0;
 		double potions = 1.0;
+		double props = 1.0;
 		Map<String, Double> parts = new LinkedHashMap<>();
 		Map<String, Double> weapons = new LinkedHashMap<>();
 		int fps = 0;
@@ -120,6 +122,7 @@ public final class HsConfig {
 		{"/hs kit auto on|off", "get the kit at the start of every fight, or keep what you carry"},
 		{"/hs hostile on|off", "wolves, golems, bees and other neutral mobs attack on sight"},
 		{"/hs balance on|off", "keeps both games' fps matched: smoother, less lag (on by default)"},
+		{"/hs props <x>", "how hard your hits push loose things in Half Sword (1 = normal, 0 = off)"},
 		{"/hs fps <n>", "cap Half Sword's fps (0 = no cap)"},
 		{"/hs clean [radius]", "remove everything you built nearby (blocks, items, arrows, TNT)"},
 		{"/hs fixground", "put back the invisible ground if you broke it"},
@@ -145,6 +148,7 @@ public final class HsConfig {
 		m.addProperty("dealt", data.dealt);
 		m.addProperty("taken", data.taken);
 		m.addProperty("potions", data.potions);
+		m.addProperty("props", data.props);
 		for (String p : PARTS) {
 			m.addProperty(p, data.parts.getOrDefault(p, 1.0));
 		}
@@ -166,6 +170,12 @@ public final class HsConfig {
 			.executes(HsConfig::help)
 			.then(Commands.literal("help").executes(HsConfig::help))
 			.then(Commands.literal("why").executes(MobDebug::why))
+			.then(Commands.literal("ground").executes(ctx -> {
+				// diagnostic: Half Sword logs how its ground scan sees the column you stand in
+				Passthrough.events.accept("{\"t\":\"groundwhy\"}");
+				ctx.getSource().sendSystemMessage(Component.literal("Half Sword: the ground under you is written to HSPassthrough.log"));
+				return 1;
+			}))
 			.then(Commands.literal("dealt").then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.0, 100.0)).executes(ctx -> {
 				data.dealt = DoubleArgumentType.getDouble(ctx, "multiplier");
 				return changed(ctx, String.format(Locale.ROOT, "damage dealt x%.2f", data.dealt));
@@ -196,6 +206,10 @@ public final class HsConfig {
 					data.weapons.put(item, DoubleArgumentType.getDouble(ctx, "multiplier"));
 					return changed(ctx, String.format(Locale.ROOT, "%s hits x%.2f", item, data.weapons.get(item)));
 				}))))
+			.then(Commands.literal("props").then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.0, 100.0)).executes(ctx -> {
+				data.props = DoubleArgumentType.getDouble(ctx, "multiplier");
+				return changed(ctx, String.format(Locale.ROOT, "hits push loose things x%.2f", data.props));
+			})))
 			.then(Commands.literal("fps").then(Commands.argument("cap", com.mojang.brigadier.arguments.IntegerArgumentType.integer(0, 300)).executes(ctx -> {
 				data.fps = com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(ctx, "cap");
 				return changed(ctx, data.fps == 0 ? "no frame cap" : "frame cap " + data.fps + " fps");
@@ -256,8 +270,8 @@ public final class HsConfig {
 					return changed(ctx, "Minecraft's frames handed over the old way");
 				})))
 			.then(Commands.literal("show").executes(ctx -> {
-				StringBuilder b = new StringBuilder(String.format(Locale.ROOT, "dealt x%.2f, taken x%.2f, potions x%.2f, frame cap %d, balance %s, export %s, hostile %s",
-					data.dealt, data.taken, data.potions, data.fps, data.balance ? "on" : "off", data.syncExport ? "sync" : "async", data.hostile ? "on" : "off"));
+				StringBuilder b = new StringBuilder(String.format(Locale.ROOT, "dealt x%.2f, taken x%.2f, potions x%.2f, props x%.2f, frame cap %d, balance %s, export %s, hostile %s",
+					data.dealt, data.taken, data.potions, data.props, data.fps, data.balance ? "on" : "off", data.syncExport ? "sync" : "async", data.hostile ? "on" : "off"));
 				for (String p : PARTS) {
 					b.append(String.format(Locale.ROOT, ", %s x%.2f", p, data.parts.getOrDefault(p, 1.0)));
 				}

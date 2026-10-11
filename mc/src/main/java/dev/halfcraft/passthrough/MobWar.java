@@ -496,8 +496,22 @@ public final class MobWar {
 		for (Entity e : level.getEntities((Entity) null, player.getBoundingBox().inflate(REPORT_RANGE), x -> x instanceof Mob && x.isAlive())) {
 			Mob mob = (Mob) e;
 			if (hostile(mob) && BRAIN_MOBS.contains(kindOf(mob))) {
+				// (a fighter who died is dropped: the next living one nearest)
+				if (mob.getBrain().getMemory(MemoryModuleType.ATTACK_TARGET).filter(MobWar::isDeadProxy).isPresent()) {
+					mob.getBrain().eraseMemory(MemoryModuleType.ATTACK_TARGET);
+				}
+
+				if (mob instanceof net.minecraft.world.entity.monster.warden.Warden warden) {
+					// a warden stays angry at whoever it fought, and goes back to the angriest
+					for (Villager v : proxies.values()) {
+						if (isDeadProxy(v)) {
+							warden.clearAnger(v);
+						}
+					}
+				}
+
 				if (Passthrough.own && !mob.getBrain().hasMemoryValue(MemoryModuleType.ATTACK_TARGET)) {
-					LivingEntity t = nearestProxy(level, mob);
+					LivingEntity t = nearestLivingProxy(mob);
 					if (t != null && t.distanceTo(mob) < 32.0F) {
 						mob.getBrain().setMemory(MemoryModuleType.ATTACK_TARGET, t);
 					}
@@ -530,6 +544,21 @@ public final class MobWar {
 		if (!forceHostile) {
 			angered.clear(); // (the rest calm down when their anger runs out)
 		}
+	}
+
+	/** The nearest living fighter's proxy, within 48 blocks of the mob. */
+	private static LivingEntity nearestLivingProxy(final Mob mob) {
+		LivingEntity best = null;
+		double bestD = 48.0 * 48.0;
+		for (Villager v : proxies.values()) {
+			double dd = v.distanceToSqr(mob);
+			if (!v.isRemoved() && !isDeadProxy(v) && dd < bestD) {
+				best = v;
+				bestD = dd;
+			}
+		}
+
+		return best;
 	}
 
 	/** The nearest standing fighter's proxy or Steve (in survival), within 32 blocks of the mob. */

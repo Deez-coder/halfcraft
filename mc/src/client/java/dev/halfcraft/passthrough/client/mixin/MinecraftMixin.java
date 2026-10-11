@@ -28,6 +28,19 @@ abstract class MinecraftMixin {
 		dev.halfcraft.passthrough.client.Pacer.endFrame();
 	}
 
+	/**
+	 * Half Sword: a swing at nobody in particular can still hit one of its loose things (a candle stand, a chain, a
+	 * weapon on the floor): where Steve looks, as far as he reaches, with how charged the blow is. The host pushes it.
+	 */
+	@Inject(method = "startAttack()Z", at = @At("HEAD"))
+	private void passthrough$swingAtProps(final CallbackInfoReturnable<Boolean> cir) {
+		Minecraft minecraft = (Minecraft) (Object) this;
+		if (Passthrough.own && minecraft.player != null && !minecraft.player.isSpectator() && minecraft.gui.screen() == null
+			&& (minecraft.hitResult == null || minecraft.hitResult.getType() != net.minecraft.world.phys.HitResult.Type.ENTITY)) {
+			dev.halfcraft.passthrough.client.OwnMode.swing(minecraft.player);
+		}
+	}
+
 	/** Half Sword: the fighters' real bodies under the crosshair (a fighter on the ground lies outside his proxy's box). */
 	@Inject(method = "pick(F)V", at = @At("TAIL"))
 	private void passthrough$pickBodies(final float partialTick, final CallbackInfo ci) {
