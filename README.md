@@ -54,6 +54,7 @@ half sword add-on (hs folder): needs visual studio (c++) and python.
 
 - made by holdup.lethimcook (discord)
 - built with claude (anthropic)
+- thanks to some testers: (DC) cazlem,boelieduppie12 for the feedback and bug reporting/feature suggestion
 - uses fabric, reshade, minhook, dumper-7 and java-websocket
 - ground collision idea from [skycraft](https://github.com/chasmlol/SkyCraft) by chasmlol
 - not affiliated with half sword games or mojang
