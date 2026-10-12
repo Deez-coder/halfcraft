@@ -273,11 +273,19 @@ public final class MobWar {
 				}
 			}
 
+			// a spear's charge (held, running or riding at him): how fast Steve came on, along his look (m/s) - Minecraft's
+			// damage already grows with it; the host makes the blow and the knock that hard too
+			double charge = 0.0;
+			if (attacker instanceof Player p && direct == p && p.isUsingItem()
+				&& p.getUseItem().has(net.minecraft.core.component.DataComponents.KINETIC_WEAPON)) {
+				charge = Math.max(0.0, p.getLookAngle().dot(p.getKnownMovement()) * 20.0);
+			}
+
 			String hit = String.format(Locale.ROOT,
 				"{\"t\":\"hit\",\"h\":%d,\"d\":%.2f,\"dir\":[%.3f,%.3f,%.3f],\"y\":%.2f,\"k\":\"%s\",\"item\":\"%s\",\"crit\":%b,"
-					+ "\"from\":[%.3f,%.3f,%.3f],\"ray\":[%.4f,%.4f,%.4f],\"kbl\":%.2f}",
+					+ "\"from\":[%.3f,%.3f,%.3f],\"ray\":[%.4f,%.4f,%.4f],\"kbl\":%.2f,\"charge\":%.2f}",
 				handle, amount * resistance(proxy) * HsConfig.weapon(item.isEmpty() ? kind : item), dx, dy, dz, Math.clamp(hy, 0.0, 1.0), kind, item, crit,
-				ox, oy, oz, rx, ry, rz, kbl);
+				ox, oy, oz, rx, ry, rz, kbl, charge);
 			// a mace smash (Steve falling onto him): its bonus (Minecraft's, for the fall, Density too) goes with the hit,
 			// and the hit lands in Minecraft too, so the mace does the rest itself (Steve bounces, no fall damage, the
 			// shockwave around, Wind Burst)
@@ -590,6 +598,7 @@ public final class MobWar {
 		aimMobs(s, level);
 		reportBurning(level);
 		reportEffects(level);
+		reportSurroundings(level);
 		pendingHits.keySet().removeIf(id -> !(level.getEntity(id) instanceof LivingEntity p) || p.isRemoved()); // (proxies gone)
 		if (Passthrough.own) {
 			arrowsIntoBodies(level);
@@ -836,25 +845,10 @@ public final class MobWar {
 			int bestHandle = -1;
 			double bestT = 2.0;
 			for (Map.Entry<Integer, double[]> e : all.entrySet()) {
-				double[] p = e.getValue();
-				for (int s = 0; s <= BODY_SEGMENTS.length; s++) {
-					double[] seg;
-					double r;
-					if (s == BODY_SEGMENTS.length) {
-						// the head: from the head bone on, as far again as the neck is below it
-						seg = new double[] {p[0], p[1], p[2], 2 * p[0] - p[3], 2 * p[1] - p[4], 2 * p[2] - p[5]};
-						r = HEAD_RADIUS;
-					} else {
-						int i = BODY_SEGMENTS[s][0] * 3, j = BODY_SEGMENTS[s][1] * 3;
-						seg = new double[] {p[i], p[i + 1], p[i + 2], p[j], p[j + 1], p[j + 2]};
-						r = BODY_RADIUS[s];
-					}
-
-					double t = segmentsMeet(ax, ay, az, bx, by, bz, seg, r + 0.05);
-					if (t >= 0.0 && t < bestT) {
-						bestT = t;
-						bestHandle = e.getKey();
-					}
+				double t = bodyMeet(e.getValue(), ax, ay, az, bx, by, bz, 0.05);
+				if (t >= 0.0 && t < bestT) {
+					bestT = t;
+					bestHandle = e.getKey();
 				}
 			}
 
@@ -882,6 +876,52 @@ public final class MobWar {
 				a.discard();
 			}
 		}
+	}
+
+	/** Where (0..1 along a-b) the line a-b first meets a body (its points `p`: head and limbs, `extra` wider), or -1. */
+	private static double bodyMeet(final double[] p, final double ax, final double ay, final double az, final double bx, final double by, final double bz,
+		final double extra) {
+		double best = -1.0;
+		for (int s = 0; s <= BODY_SEGMENTS.length; s++) {
+			double[] seg;
+			double r;
+			if (s == BODY_SEGMENTS.length) {
+				// the head: from the head bone on, as far again as the neck is below it
+				seg = new double[] {p[0], p[1], p[2], 2 * p[0] - p[3], 2 * p[1] - p[4], 2 * p[2] - p[5]};
+				r = HEAD_RADIUS;
+			} else {
+				int i = BODY_SEGMENTS[s][0] * 3, j = BODY_SEGMENTS[s][1] * 3;
+				seg = new double[] {p[i], p[i + 1], p[i + 2], p[j], p[j + 1], p[j + 2]};
+				r = BODY_RADIUS[s];
+			}
+
+			double t = segmentsMeet(ax, ay, az, bx, by, bz, seg, r + extra);
+			if (t >= 0.0 && (best < 0.0 || t < best)) {
+				best = t;
+			}
+		}
+
+		return best;
+	}
+
+	/**
+	 * The host people's proxies whose real bodies the line a-b passes through (`extra` wider), each with where along it
+	 * (0..1). A spear's jab and charge pick targets by their boxes, and a proxy's upright box isn't where a lying or
+	 * leaning body is.
+	 */
+	public static Map<LivingEntity, Double> bodiesAlong(final Vec3 a, final Vec3 b, final double extra) {
+		Map<LivingEntity, Double> out = new HashMap<>();
+		for (Map.Entry<Integer, double[]> e : bodies.entrySet()) {
+			Villager proxy = proxies.get(e.getKey());
+			if (proxy != null && !proxy.isRemoved()) {
+				double t = bodyMeet(e.getValue(), a.x, a.y, a.z, b.x, b.y, b.z, extra);
+				if (t >= 0.0) {
+					out.put(proxy, t);
+				}
+			}
+		}
+
+		return out;
 	}
 
 	/**
@@ -932,6 +972,110 @@ public final class MobWar {
 		if (b != null) {
 			Passthrough.events.accept(b.append("]}").toString());
 		}
+	}
+
+	/** Body points (into a fighter's 16) checked for water and powder snow: feet, knees, pelvis, spine, neck, head. */
+	private static final int[] IN_POINTS = {12, 15, 11, 14, 3, 2, 1, 0};
+	/** Air a fighter has left (Minecraft's: 300 ticks, drowning below 0), ticks he's been in powder snow, in lava. */
+	private static final Map<Integer, Integer> air = new HashMap<>(), frozen = new HashMap<>(), burnt = new HashMap<>();
+	private static int envTicks;
+	private static boolean envSent;
+
+	/**
+	 * Minecraft's water, powder snow and lava on the host's fighters, by their real bodies, every 2 ticks:
+	 * {"t":"env","f":[handle, water, snow, lava, flow x, flow z, drowning, frozen, ...]} - how much of him is in each
+	 * (0..1), the current where his hips are (water's or lava's), drowning 1 once his air is out (the host chokes him),
+	 * frozen how far he's frozen (1: through); an empty list once after the last. As Minecraft does them (but freezing
+	 * twice as hard: the fighters heal between): drowning (15 s of air with his head under, then 2 every second),
+	 * freezing (7 s in powder snow, then 2 every 2 s) and lava (4 every half second, and it sets him on fire: Fire
+	 * Resistance spares him both) go as "magic", the fire as his proxy's.
+	 */
+	private static void reportSurroundings(final ServerLevel level) {
+		if (++envTicks < 2 || !Passthrough.own) {
+			return;
+		}
+
+		envTicks = 0;
+		StringBuilder b = null;
+		BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+		for (Map.Entry<Integer, double[]> e : bodies.entrySet()) {
+			int handle = e.getKey();
+			Villager proxy = proxies.get(handle);
+			if (proxy == null || proxy.isRemoved() || isDeadProxy(proxy)) {
+				continue;
+			}
+
+			double[] p = e.getValue();
+			int water = 0, snow = 0, lava = 0;
+			boolean headUnder = false;
+			Vec3 flow = Vec3.ZERO;
+			for (int i : IN_POINTS) {
+				double x = p[i * 3], y = p[i * 3 + 1], z = p[i * 3 + 2];
+				pos.set(Math.floor(x), Math.floor(y), Math.floor(z));
+				// a foot in the host's uneven ground (a solid cell, which holds no fluid) wades in what's on top of it
+				HostGround.Cell ground = HostGround.cellAt(pos);
+				if (ground != null && ground.solid() && level.getFluidState(pos).isEmpty() && y >= pos.getY() + ground.top() - 0.3) {
+					pos.move(0, 1, 0);
+					y = Math.max(y, pos.getY());
+				}
+
+				net.minecraft.world.level.material.FluidState fluid = level.getFluidState(pos);
+				if (fluid.is(net.minecraft.tags.FluidTags.WATER) && y <= pos.getY() + fluid.getHeight(level, pos)) {
+					water++;
+					headUnder |= i == 0;
+					if (i == 3) {
+						flow = fluid.getFlow(level, pos);
+					}
+				} else if (fluid.is(net.minecraft.tags.FluidTags.LAVA) && y <= pos.getY() + fluid.getHeight(level, pos)) {
+					lava++;
+					if (i == 3) {
+						flow = fluid.getFlow(level, pos);
+					}
+				} else if (level.getBlockState(pos).is(net.minecraft.world.level.block.Blocks.POWDER_SNOW)) {
+					snow++;
+				}
+			}
+
+			boolean fireproof = proxy.hasEffect(MobEffects.FIRE_RESISTANCE);
+			int hot = lava > 0 ? burnt.getOrDefault(handle, 0) + 2 : 0;
+			if (lava > 0 && !fireproof) {
+				proxy.igniteForSeconds(15.0F); // (burning: reportBurning; it goes on a while after he's out, as in Minecraft)
+				if (hot % 10 < 2) {
+					Passthrough.events.accept(String.format(Locale.ROOT, "{\"t\":\"magic\",\"h\":%d,\"d\":4.00,\"k\":\"lava\",\"nokill\":false}", handle));
+				}
+			}
+
+			burnt.put(handle, hot);
+
+			int left = air.getOrDefault(handle, 300);
+			left = headUnder ? left - 2 : Math.min(300, left + 8);
+			if (left <= -20) {
+				left = 0;
+				Passthrough.events.accept(String.format(Locale.ROOT, "{\"t\":\"magic\",\"h\":%d,\"d\":2.00,\"k\":\"drowning\",\"nokill\":false}", handle));
+			}
+
+			air.put(handle, left);
+			int cold = snow > 0 ? frozen.getOrDefault(handle, 0) + 2 : Math.max(0, frozen.getOrDefault(handle, 0) - 4);
+			if (cold >= 140 && cold % 40 < 2) {
+				Passthrough.events.accept(String.format(Locale.ROOT, "{\"t\":\"magic\",\"h\":%d,\"d\":2.00,\"k\":\"freezing\",\"nokill\":false}", handle));
+			}
+
+			frozen.put(handle, cold);
+			if (water > 0 || snow > 0 || lava > 0) {
+				b = b == null ? new StringBuilder("{\"t\":\"env\",\"f\":[") : b.append(',');
+				b.append(String.format(Locale.ROOT, "%d,%.2f,%.2f,%.2f,%.3f,%.3f,%d,%.2f", handle, water / (double) IN_POINTS.length,
+					snow / (double) IN_POINTS.length, lava / (double) IN_POINTS.length, flow.x, flow.z, headUnder && left <= 0 ? 1 : 0, Math.min(1.0, cold / 140.0)));
+			}
+		}
+
+		air.keySet().retainAll(bodies.keySet());
+		frozen.keySet().retainAll(bodies.keySet());
+		burnt.keySet().retainAll(bodies.keySet());
+		if (b != null || envSent) {
+			Passthrough.events.accept(b == null ? "{\"t\":\"env\",\"f\":[]}" : b.append("]}").toString());
+		}
+
+		envSent = b != null;
 	}
 
 	/** The proxy nearest (x, y, z), within 4 blocks (server thread). */

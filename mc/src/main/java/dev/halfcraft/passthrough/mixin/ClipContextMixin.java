@@ -39,9 +39,7 @@ abstract class ClipContextMixin {
 		}
 
 		VoxelShape shape = cir.getReturnValue();
-		if (HostGround.exactInstead(state, cell)) {
-			cir.setReturnValue(cell.shape()); // our barrier in a partial cell: aim at the slope, not at its box
-		} else if (shape != Shapes.block()) {
+		if (shape != Shapes.block()) {
 			cir.setReturnValue(shape.isEmpty() ? cell.shape() : Shapes.or(shape, cell.shape()));
 		}
 	}

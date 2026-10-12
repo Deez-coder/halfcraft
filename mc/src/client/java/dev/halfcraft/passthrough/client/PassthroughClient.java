@@ -88,6 +88,9 @@ public class PassthroughClient implements ClientModInitializer {
 		ServerTickEvents.END_SERVER_TICK.register(server -> {
 			if (setupIn > 0 && --setupIn == 0) {
 				SETUP.forEach(WorldBridge::command);
+				// the host may have sent its ground before this world was up (Minecraft restarted while it ran): all of it
+				// again, now that there's a world to put it in
+				WorldBridge.restoreGround();
 			}
 		});
 	}

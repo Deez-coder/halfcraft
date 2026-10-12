@@ -31,12 +31,16 @@ import net.minecraft.network.chat.Component;
  * <li>/hs help (or just /hs): what every command does</li>
  * <li>/hs show; /hs reset: every setting back to its default</li>
  * <li>/hs clean [radius]: remove every placed block (default within 64), loose items, arrows, TNT; ground restored</li>
- * <li>/hs fixground: put back broken barriers of the host's ground</li>
+ * <li>/hs fixground: Half Sword scans its ground again and resends it</li>
  * <li>/hs fps &lt;n&gt;: Half Sword's frame cap (0 = none): what it leaves of the GPU goes to Minecraft</li>
  * <li>/hs kit save|give|reset|auto on|off: your inventory as the kit you get at the start of every Half Sword fight</li>
  * <li>/hs hostile on|off: neutral mobs (wolves, golems, bees, endermen...) attack the fighters and Steve on sight</li>
  * <li>/hs balance on|off: each game no faster than a little above the other (the GPU goes to frames that are shown)</li>
+ * <li>/hs mining on|off, /hs mining &lt;x&gt;: whether the fighters break Minecraft's blocks by hitting them, and how fast</li>
+ * <li>/hs current &lt;x&gt;: how hard water's and lava's currents push the fighters</li>
  * <li>/hs props &lt;x&gt;: how hard Steve's hits push Half Sword's loose things (candle stands, chains, weapons)</li>
+ * <li>/hs ground, /hs why: for bug reports - how the ground under you was scanned (Half Sword's log), what the nearest
+ * mob's pathfinding makes of where it stands</li>
  * <li>/hs export sync|async: hand Minecraft's frames over as soon as the GPU has them (sync), or Minecraft's own way</li>
  * </ul>
  * The host applies dealt/taken/part (it knows where a hit lands); weapon multipliers apply here, to the hit's damage.
@@ -51,6 +55,9 @@ public final class HsConfig {
 		double taken = 1.0;
 		double potions = 1.0;
 		double props = 1.0;
+		boolean mining = true;
+		double current = 1.0;
+		double miningStrength = 1.0;
 		Map<String, Double> parts = new LinkedHashMap<>();
 		Map<String, Double> weapons = new LinkedHashMap<>();
 		int fps = 0;
@@ -102,6 +109,11 @@ public final class HsConfig {
 		}
 	}
 
+	/** How hard the fighters' blows wear Minecraft's blocks down (0: they don't). */
+	public static double mining() {
+		return data.mining ? data.miningStrength : 0.0;
+	}
+
 	/** The multiplier for one Minecraft item's hits (1 if none set). */
 	public static double weapon(final String item) {
 		return data.weapons.getOrDefault(item, 1.0);
@@ -122,14 +134,16 @@ public final class HsConfig {
 		{"/hs kit auto on|off", "get the kit at the start of every fight, or keep what you carry"},
 		{"/hs hostile on|off", "wolves, golems, bees and other neutral mobs attack on sight"},
 		{"/hs balance on|off", "keeps both games' fps matched: smoother, less lag (on by default)"},
+		{"/hs mining on|off", "fighters break your blocks by hitting them (on by default)"},
+		{"/hs mining <x>", "how fast fighters break blocks (1 = normal, 2 = twice as fast)"},
+		{"/hs current <x>", "how hard water and lava currents push fighters (1 = normal, 0 = not at all)"},
 		{"/hs props <x>", "how hard your hits push loose things in Half Sword (1 = normal, 0 = off)"},
 		{"/hs fps <n>", "cap Half Sword's fps (0 = no cap)"},
 		{"/hs clean [radius]", "remove everything you built nearby (blocks, items, arrows, TNT)"},
-		{"/hs fixground", "put back the invisible ground if you broke it"},
-		{"/hs barriers", "which map this is and how many barrier changes you saved for it"},
-		{"/hs barriers save", "remember the barriers you broke or placed around you, for this map, every time"},
-		{"/hs barriers reset", "forget this map's barrier changes: the barriers go back to what the mod makes"},
+		{"/hs fixground", "scan the invisible ground again if you fall through it"},
 		{"/hs export sync|async", "how Minecraft's picture is sent (sync = less lag, the default)"},
+		{"/hs ground", "for bug reports: writes how the ground under you was scanned to HSPassthrough.log"},
+		{"/hs why", "for bug reports: what the nearest mob's pathfinding makes of where it stands"},
 	};
 
 	private static int help(final CommandContext<CommandSourceStack> ctx) {
@@ -149,6 +163,7 @@ public final class HsConfig {
 		m.addProperty("taken", data.taken);
 		m.addProperty("potions", data.potions);
 		m.addProperty("props", data.props);
+		m.addProperty("current", data.current);
 		for (String p : PARTS) {
 			m.addProperty(p, data.parts.getOrDefault(p, 1.0));
 		}
@@ -206,6 +221,23 @@ public final class HsConfig {
 					data.weapons.put(item, DoubleArgumentType.getDouble(ctx, "multiplier"));
 					return changed(ctx, String.format(Locale.ROOT, "%s hits x%.2f", item, data.weapons.get(item)));
 				}))))
+			.then(Commands.literal("mining")
+				.then(Commands.literal("on").executes(ctx -> {
+					data.mining = true;
+					return changed(ctx, "fighters break blocks by hitting them");
+				}))
+				.then(Commands.literal("off").executes(ctx -> {
+					data.mining = false;
+					return changed(ctx, "fighters can't break blocks");
+				}))
+				.then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.0, 100.0)).executes(ctx -> {
+					data.miningStrength = DoubleArgumentType.getDouble(ctx, "multiplier");
+					return changed(ctx, String.format(Locale.ROOT, "fighters break blocks x%.2f", data.miningStrength));
+				})))
+			.then(Commands.literal("current").then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.0, 100.0)).executes(ctx -> {
+				data.current = DoubleArgumentType.getDouble(ctx, "multiplier");
+				return changed(ctx, String.format(Locale.ROOT, "currents push fighters x%.2f", data.current));
+			})))
 			.then(Commands.literal("props").then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.0, 100.0)).executes(ctx -> {
 				data.props = DoubleArgumentType.getDouble(ctx, "multiplier");
 				return changed(ctx, String.format(Locale.ROOT, "hits push loose things x%.2f", data.props));
@@ -270,8 +302,8 @@ public final class HsConfig {
 					return changed(ctx, "Minecraft's frames handed over the old way");
 				})))
 			.then(Commands.literal("show").executes(ctx -> {
-				StringBuilder b = new StringBuilder(String.format(Locale.ROOT, "dealt x%.2f, taken x%.2f, potions x%.2f, props x%.2f, frame cap %d, balance %s, export %s, hostile %s",
-					data.dealt, data.taken, data.potions, data.props, data.fps, data.balance ? "on" : "off", data.syncExport ? "sync" : "async", data.hostile ? "on" : "off"));
+				StringBuilder b = new StringBuilder(String.format(Locale.ROOT, "dealt x%.2f, taken x%.2f, potions x%.2f, props x%.2f, current x%.2f, mining %s, frame cap %d, balance %s, export %s, hostile %s",
+					data.dealt, data.taken, data.potions, data.props, data.current, data.mining ? String.format(Locale.ROOT, "x%.2f", data.miningStrength) : "off", data.fps, data.balance ? "on" : "off", data.syncExport ? "sync" : "async", data.hostile ? "on" : "off"));
 				for (String p : PARTS) {
 					b.append(String.format(Locale.ROOT, ", %s x%.2f", p, data.parts.getOrDefault(p, 1.0)));
 				}
@@ -291,45 +323,9 @@ public final class HsConfig {
 				.executes(ctx -> clean(ctx, 64))
 				.then(Commands.argument("radius", com.mojang.brigadier.arguments.IntegerArgumentType.integer(1, 256))
 					.executes(ctx -> clean(ctx, com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(ctx, "radius")))))
-			.then(Commands.literal("barriers")
-				.executes(ctx -> {
-					String map = BarrierOverrides.map();
-					if (map == null) {
-						ctx.getSource().sendSystemMessage(Component.literal("Half Sword: no map yet (start a fight)"));
-						return 0;
-					}
-
-					int[] n = BarrierOverrides.counts();
-					ctx.getSource().sendSystemMessage(Component.literal("Half Sword: map " + map + ": " + n[0] + " barriers you added, " + n[1]
-						+ " you removed (/hs barriers save after changing more, /hs barriers reset to undo them all)"));
-					return 1;
-				})
-				.then(Commands.literal("save").executes(ctx -> {
-					int[] n = BarrierOverrides.save(ctx.getSource().getLevel(), ctx.getSource().getPlayerOrException().blockPosition());
-					if (n == null) {
-						ctx.getSource().sendSystemMessage(Component.literal("Half Sword: no map yet (start a fight)"));
-						return 0;
-					}
-
-					int[] all = BarrierOverrides.counts();
-					ctx.getSource().sendSystemMessage(Component.literal("Half Sword: saved for " + BarrierOverrides.map() + ": " + n[0] + " new barriers added, "
-						+ n[1] + " removed (in all " + all[0] + " added, " + all[1] + " removed on this map)"));
-					return 1;
-				}))
-				.then(Commands.literal("reset").executes(ctx -> {
-					int gone = BarrierOverrides.reset(ctx.getSource().getLevel());
-					if (gone < 0) {
-						ctx.getSource().sendSystemMessage(Component.literal("Half Sword: no map yet (start a fight)"));
-						return 0;
-					}
-
-					ctx.getSource().sendSystemMessage(Component.literal("Half Sword: " + BarrierOverrides.map() + "'s barriers are back to normal (" + gone
-						+ " of yours removed, the mod's put back)"));
-					return 1;
-				})))
 			.then(Commands.literal("fixground").executes(ctx -> {
-				int back = WorldBridge.restoreGround(ctx.getSource().getLevel());
-				ctx.getSource().sendSystemMessage(Component.literal("Half Sword: ground restored (" + back + " barriers put back)"));
+				WorldBridge.restoreGround();
+				ctx.getSource().sendSystemMessage(Component.literal("Half Sword: the ground is scanned again"));
 				return 1;
 			})));
 	}

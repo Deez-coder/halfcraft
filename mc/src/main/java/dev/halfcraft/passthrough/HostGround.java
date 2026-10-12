@@ -10,16 +10,17 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.phys.shapes.BitSetDiscreteVoxelShape;
 import net.minecraft.world.phys.shapes.CubeVoxelShape;
 import net.minecraft.world.phys.shapes.Shapes;
-import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
 /**
- * The host's ground and walls as Minecraft collision, at 1/8 of a block. The host sends cells (blocks): a cell wholly
- * inside its geometry becomes a barrier block (WorldBridge: a real block, so building on it, redstone and pathfinding
- * work as usual); a cell partly inside (the top of a slope, a step, a railing, a ledge) becomes a shape of 1/8-block
- * cubes, merged into every block-collision query (BlockCollisionsMixin) and into mob pathfinding the way vanilla
- * treats slabs (WalkNodeEvaluatorMixin). Uneven ground no longer turns into 1-block steps, and floors over floors work.
+ * The host's ground and walls as Minecraft collision, at 1/8 of a block. The host sends cells (blocks): wholly inside
+ * its geometry, partly (the top of a slope, a step, a railing, a ledge: a shape of 1/8-block cubes) or not at all.
+ * No blocks are placed for them: the cells are merged into every block-collision query (BlockCollisionsMixin), aim
+ * (ClipContextMixin) and mob pathfinding the way vanilla treats slabs (WalkNodeEvaluatorMixin), and a "solid" cell
+ * (whole, or the ground's surface on a slope) is a full block to whatever needs one under or beside it - torches,
+ * redstone, rails, doors, water and lava, sand and gravel (HostGroundStateMixin, FluidMixin, FallingBlockMixin).
  * The idea (shapes merged into block collision) comes from SkyCraft (github.com/chasmlol/SkyCraft, MIT).
  */
 public final class HostGround {
@@ -33,48 +34,63 @@ public final class HostGround {
 		FENCE
 	}
 
-	/** A cell: its shape, its height (0..1 of the cell) and kind. */
-	public record Cell(VoxelShape shape, double top, Kind kind, boolean support) {
+	/**
+	 * A cell: its shape, its height (0..1 of the cell) and kind; `walls`: the sides it's a wall to put things on (a
+	 * torch, a ladder, a button; a lantern or a chain hanging under a ceiling): bit 0 east and west, bit 1 north and
+	 * south, bit 2 top and bottom - at least half the side is covered.
+	 */
+	public record Cell(VoxelShape shape, double top, Kind kind, boolean support, int walls) {
 		/** A whole cell (its barrier is exactly its shape). */
 		public boolean whole() {
 			return this.shape == Shapes.block();
 		}
 
-		/** The mod puts a barrier here: a whole cell, or the ground's surface as support. */
-		public boolean barrier() {
+		/** A full block to what needs one (support, fluids, falling blocks): a whole cell, or the ground's surface. */
+		public boolean solid() {
 			return this.support || this.whole();
 		}
 
 		Cell withSupport(final boolean on) {
-			return on == this.support ? this : new Cell(this.shape, this.top, this.kind, on);
+			return on == this.support ? this : new Cell(this.shape, this.top, this.kind, on, this.walls);
+		}
+
+		/** A side something can be put on or hang from. */
+		public boolean wallFacing(final net.minecraft.core.Direction side) {
+			return switch (side.getAxis()) {
+				case X -> (this.walls & 1) != 0;
+				case Z -> (this.walls & 2) != 0;
+				case Y -> (this.walls & 4) != 0;
+			};
 		}
 	}
 
-	/** Server thread: the cells around a spot (BarrierOverrides: which barriers are the mod's). */
-	public static void forEachNear(final BlockPos around, final int radius, final int below, final int above,
-		final java.util.function.BiConsumer<BlockPos, Cell> action) {
-		for (Map.Entry<Long, Cell> e : CELLS.entrySet()) {
-			BlockPos p = BlockPos.of(e.getKey());
-			if (Math.abs(p.getX() - around.getX()) <= radius && Math.abs(p.getZ() - around.getZ()) <= radius && p.getY() >= around.getY() - below
-				&& p.getY() <= around.getY() + above) {
-				action.accept(p, e.getValue());
-			}
+	/** In the host's world (the overworld; a getter that isn't a level, like a pathfinding region, counts). */
+	public static boolean inHost(final BlockGetter level) {
+		return !(level instanceof net.minecraft.world.level.Level l && l.dimension() != net.minecraft.world.level.Level.OVERWORLD);
+	}
+
+	/** An empty spot (air) in the host's world where its ground is a full block (whole, or its surface). */
+	public static boolean solidAir(final BlockGetter level, final BlockPos pos, final BlockState state) {
+		if (CELLS.isEmpty() || !state.isAir()) {
+			return false;
 		}
+
+		Cell c = CELLS.get(pos.asLong());
+		return c != null && c.solid() && inHost(level);
 	}
 
-	/**
-	 * A partial cell with one of our barriers in it (support for torches, redstone, water on a slope): collision and
-	 * aim use the cell's exact shape instead of the barrier's whole block (BlockCollisionsMixin, ClipContextMixin).
-	 */
-	public static boolean exactInstead(final BlockState state, final Cell cell) {
-		return cell != null && !cell.whole() && state.is(Blocks.BARRIER);
+	/** As solidAir, or a wall to hang things on that side (the face a torch, a ladder or a button is put against). */
+	public static boolean sturdyAir(final BlockGetter level, final BlockPos pos, final BlockState state, final net.minecraft.core.Direction side) {
+		if (CELLS.isEmpty() || !state.isAir()) {
+			return false;
+		}
+
+		Cell c = CELLS.get(pos.asLong());
+		return c != null && (c.solid() || c.wallFacing(side)) && inHost(level);
 	}
 
-	/**
-	 * A whole cell: a barrier block, and this shape behind it, so the ground stays solid where the barrier is broken
-	 * (creative) or replaced.
-	 */
-	private static final Cell WHOLE = new Cell(Shapes.block(), 1.0, Kind.SOLID, false);
+	/** A whole cell. */
+	private static final Cell WHOLE = new Cell(Shapes.block(), 1.0, Kind.SOLID, false, 7);
 
 	/** Cells by BlockPos.asLong (read by collision on any thread; written on the server thread). */
 	private static final Map<Long, Cell> CELLS = new ConcurrentHashMap<>();
@@ -185,14 +201,11 @@ public final class HostGround {
 				long key = pos.asLong();
 				if (full[i]) {
 					CELLS.put(key, WHOLE);
-					WorldBridge.groundBarrier(level, pos, true);
 				} else if (shapes[i] != null) {
-					CELLS.put(key, shapes[i].withSupport(support[i])); // (first: collision takes the exact shape over the barrier from now on)
-					// the ground's surface (a slope's cell, a step): a barrier too, so torches, redstone and water have a real
-					// block to stand on there (the host decides: props on the ground, like carriages, get none)
-					WorldBridge.groundBarrier(level, pos, support[i]);
+					// the ground's surface (a slope's cell, a step) is "solid" too: torches, redstone and water have a block to
+					// stand on there (the host decides: props on the ground, like carriages, aren't)
+					CELLS.put(key, shapes[i].withSupport(support[i]));
 				} else {
-					WorldBridge.groundBarrier(level, pos, false);
 					CELLS.remove(key);
 				}
 
@@ -201,7 +214,7 @@ public final class HostGround {
 		});
 	}
 
-	/** {"t":"clear"} (the barriers go in WorldBridge.clearSolid): every shape goes. */
+	/** {"t":"clear"} (a new fight, a new map): every cell goes. */
 	public static void clear() {
 		MinecraftServer s = WorldBridge.server();
 		if (s == null) {
@@ -219,7 +232,7 @@ public final class HostGround {
 		});
 	}
 
-	/** The cell of a mask: null when it is empty or completely full (a full cell is a barrier instead). */
+	/** The cell of a mask: null when it is empty or completely full (a full one is a whole cell). */
 	private static Cell cell(final byte[] bits) {
 		if (bits.length != 64) {
 			return null;
@@ -255,9 +268,28 @@ public final class HostGround {
 			upperColumns += Integer.bitCount(any);
 		}
 
+		// what it covers seen from the side: east-west (rows of y and z), north-south (y and x), and from above (x and z)
+		int seenX = 0, seenZ = 0, seenY = 0;
+		int[] columns = new int[8]; // per z row, the x columns with anything at any height
+		for (int y = 0; y < 8; y++) {
+			int anyRow = 0;
+			for (int z = 0; z < 8; z++) {
+				int row = bits[y * 8 + z] & 0xFF;
+				seenX += row != 0 ? 1 : 0;
+				anyRow |= row;
+				columns[z] |= row;
+			}
+
+			seenZ += Integer.bitCount(anyRow);
+		}
+
+		for (int column : columns) {
+			seenY += Integer.bitCount(column);
+		}
+
 		double top = (topLayer + 1) / 8.0;
 		Kind kind = top <= 0.5 ? Kind.LOW : upperColumns >= 32 ? Kind.SOLID : Kind.FENCE;
-		return new Cell(new CubeVoxelShape(cubes), top, kind, false);
+		return new Cell(new CubeVoxelShape(cubes), top, kind, false, (seenX >= 32 ? 1 : 0) | (seenZ >= 32 ? 2 : 0) | (seenY >= 32 ? 4 : 0));
 	}
 
 	private static boolean isFull(final String mask) {

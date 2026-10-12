@@ -3,8 +3,6 @@ package dev.halfcraft.passthrough;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.entity.LivingEntity;
@@ -24,21 +22,18 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 
-/** Server-side half: the host's collision as invisible barrier blocks, commands, and events back to the host. */
+/**
+ * Server-side half: commands, block changes and events back to the host. The host's ground is no blocks (HostGround);
+ * older versions of the mod placed barrier blocks for it, and those left in a save go at the first fight of a session.
+ */
 public final class WorldBridge {
 	private static volatile MinecraftServer server;
-	/** Barriers we placed (so a reset only removes ours, never the player's builds). */
-	private static final Set<BlockPos> barriers = ConcurrentHashMap.newKeySet();
 	/** Block changes this tick (server thread only): true = now solid, false = gone. Sent at the end of the tick. */
 	private static final Map<BlockPos, Boolean> changes = new LinkedHashMap<>();
-	/** While placing or removing the host's own ground: those changes aren't news to the host (server thread only). */
+	/** While the Nether turns the host's ground: those changes aren't news to the host (server thread only). */
 	private static boolean placingGround;
-	/** The save's leftover barriers were removed this session (WorldBridge.clearSolid). */
+	/** The barriers an older version left in the save are gone (once a session). */
 	private static boolean legacyCleaned;
-	/** Ground barriers placed and removed since the last report (the log: are they churning?). */
-	private static int barriersPlaced, barriersRemoved, reportTicks;
-	/** The barrier set changed since it was last written to the world's record. */
-	private static boolean recordDirty;
 
 	private WorldBridge() {
 	}
@@ -49,8 +44,8 @@ public final class WorldBridge {
 
 	static void detach() {
 		server = null;
-		barriers.clear();
 	}
+
 
 	public static boolean ready() {
 		return server != null;
@@ -60,62 +55,7 @@ public final class WorldBridge {
 		return server;
 	}
 
-	/** Columns of solid ground from the host: {x, z, yBottom, yTop, ...} in block coordinates (inclusive). Only air is replaced. */
-	public static void solid(final int[] columns) {
-		MinecraftServer s = server;
-		if (s == null) {
-			return;
-		}
-
-		s.execute(() -> {
-			ServerLevel level = s.overworld();
-			BlockState barrier = Blocks.BARRIER.defaultBlockState();
-			BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-			placingGround = true;
-			for (int i = 0; i + 3 < columns.length; i += 4) {
-				for (int y = columns[i + 2]; y <= columns[i + 3]; y++) {
-					pos.set(columns[i], y, columns[i + 1]);
-					if (level.isInWorldBounds(pos) && level.getBlockState(pos).isAir()) {
-						level.setBlock(pos, barrier, Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
-						barriers.add(pos.immutable());
-					}
-				}
-			}
-
-			placingGround = false;
-		});
-	}
-
-	/** Server thread: one of the host's full ground cells (HostGround) as a barrier (only into air), or not any more. */
-	static void groundBarrier(final ServerLevel level, final BlockPos pos, final boolean on) {
-		placingGround = true;
-		if (on) {
-			if (level.isInWorldBounds(pos) && level.getBlockState(pos).isAir() && !BarrierOverrides.suppressed(pos)) {
-				level.setBlock(pos, Blocks.BARRIER.defaultBlockState(), Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
-				barriers.add(pos.immutable());
-				barriersPlaced++;
-				recordDirty = true;
-			}
-		} else if (barriers.remove(pos) && level.getBlockState(pos).is(Blocks.BARRIER)) {
-			level.setBlock(pos, Blocks.AIR.defaultBlockState(), Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
-			barriersRemoved++;
-			recordDirty = true;
-		}
-
-		placingGround = false;
-	}
-
-	/** The ground barriers the mod placed (server thread). */
-	static Set<BlockPos> groundBarriers() {
-		return barriers;
-	}
-
-	/** A ground barrier the player removed for good (BarrierOverrides): no longer the mod's. */
-	static void forgetBarrier(final BlockPos pos) {
-		barriers.remove(pos);
-	}
-
-	/** Remove every barrier we placed (e.g. when the host teleports somewhere else). */
+	/** The host's ground was cleared (a new fight, a new map): the player hovers until it's in. */
 	public static void clearSolid() {
 		MinecraftServer s = server;
 		if (s == null) {
@@ -124,120 +64,85 @@ public final class WorldBridge {
 
 		s.execute(() -> {
 			startHold(s);
-			ServerLevel level = s.overworld();
-			placingGround = true;
-			for (BlockPos pos : barriers) {
-				if (level.getBlockState(pos).is(Blocks.BARRIER)) {
-					level.setBlock(pos, Blocks.AIR.defaultBlockState(), Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
-				}
-			}
-
-			// once per session: barriers left in the save by the last session (its record: wherever they are), and by an
-			// older version of the mod (around the player)
 			if (!legacyCleaned) {
-				int recorded = 0;
-				for (long key : readRecord(s)) {
-					BlockPos p = BlockPos.of(key);
-					if (level.getBlockState(p).is(Blocks.BARRIER)) {
+				legacyCleaned = true;
+				removeOldBarriers(s);
+			}
+		});
+	}
+
+	/**
+	 * The barriers older versions of the mod placed for the host's ground: those the last of them recorded (wherever
+	 * they are; the record goes too), and any in the loaded chunks around the player. Server thread.
+	 */
+	private static void removeOldBarriers(final MinecraftServer s) {
+		ServerLevel level = s.overworld();
+		placingGround = true;
+		java.nio.file.Path record = s.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).resolve("passthrough-ground-barriers.txt");
+		int recorded = 0;
+		try {
+			if (java.nio.file.Files.exists(record)) {
+				for (String line : java.nio.file.Files.readAllLines(record)) {
+					BlockPos p = line.isBlank() ? null : BlockPos.of(Long.parseLong(line.trim()));
+					if (p != null && level.getBlockState(p).is(Blocks.BARRIER)) {
 						level.setBlock(p, Blocks.AIR.defaultBlockState(), Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
 						recorded++;
 					}
 				}
 
-				Passthrough.LOG.info("ground: removed {} barriers the last session left (its record)", recorded);
-				legacyCleaned = true;
-				ServerPlayer player = s.getPlayerList().getPlayers().isEmpty() ? null : s.getPlayerList().getPlayers().get(0);
-				if (player != null) {
-					// every loaded chunk within 16 of the player, every height; sections without a barrier are skipped
-					// whole (the world is void: nearly all of them)
-					BlockPos.MutableBlockPos p = new BlockPos.MutableBlockPos();
-					int pcx = player.getBlockX() >> 4, pcz = player.getBlockZ() >> 4, removed = 0;
-					for (int cx = pcx - 16; cx <= pcx + 16; cx++) {
-						for (int cz = pcz - 16; cz <= pcz + 16; cz++) {
-							net.minecraft.world.level.chunk.LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
-							if (chunk == null) {
-								continue;
-							}
+				java.nio.file.Files.delete(record);
+			}
+		} catch (Exception e) {
+			Passthrough.LOG.warn("ground: couldn't read the old barrier record: {}", e.toString());
+		}
 
-							net.minecraft.world.level.chunk.LevelChunkSection[] sections = chunk.getSections();
-							for (int si = 0; si < sections.length; si++) {
-								net.minecraft.world.level.chunk.LevelChunkSection section = sections[si];
-								if (section.hasOnlyAir() || !section.getStates().maybeHas(st -> st.is(Blocks.BARRIER))) {
-									continue;
-								}
+		Passthrough.LOG.info("ground: removed {} barriers an older version recorded", recorded);
 
-								int baseY = chunk.getSectionYFromSectionIndex(si) << 4;
-								for (int x = 0; x < 16; x++) {
-									for (int y = 0; y < 16; y++) {
-										for (int z = 0; z < 16; z++) {
-											if (section.getBlockState(x, y, z).is(Blocks.BARRIER)) {
-												p.set((cx << 4) + x, baseY + y, (cz << 4) + z);
-												level.setBlock(p, Blocks.AIR.defaultBlockState(), Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
-												removed++;
-											}
-										}
+		ServerPlayer player = s.getPlayerList().getPlayers().isEmpty() ? null : s.getPlayerList().getPlayers().get(0);
+		if (player != null) {
+			// every loaded chunk within 16 of the player, every height; sections without a barrier are skipped
+			// whole (the world is void: nearly all of them)
+			BlockPos.MutableBlockPos p = new BlockPos.MutableBlockPos();
+			int pcx = player.getBlockX() >> 4, pcz = player.getBlockZ() >> 4, removed = 0;
+			for (int cx = pcx - 16; cx <= pcx + 16; cx++) {
+				for (int cz = pcz - 16; cz <= pcz + 16; cz++) {
+					net.minecraft.world.level.chunk.LevelChunk chunk = level.getChunkSource().getChunkNow(cx, cz);
+					if (chunk == null) {
+						continue;
+					}
+
+					net.minecraft.world.level.chunk.LevelChunkSection[] sections = chunk.getSections();
+					for (int si = 0; si < sections.length; si++) {
+						net.minecraft.world.level.chunk.LevelChunkSection section = sections[si];
+						if (section.hasOnlyAir() || !section.getStates().maybeHas(st -> st.is(Blocks.BARRIER))) {
+							continue;
+						}
+
+						int baseY = chunk.getSectionYFromSectionIndex(si) << 4;
+						for (int x = 0; x < 16; x++) {
+							for (int y = 0; y < 16; y++) {
+								for (int z = 0; z < 16; z++) {
+									if (section.getBlockState(x, y, z).is(Blocks.BARRIER)) {
+										p.set((cx << 4) + x, baseY + y, (cz << 4) + z);
+										level.setBlock(p, Blocks.AIR.defaultBlockState(), Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
+										removed++;
 									}
 								}
 							}
 						}
 					}
-
-					Passthrough.LOG.info("ground: removed {} other barriers left in the save (loaded chunks around the player)", removed);
 				}
 			}
 
-			placingGround = false;
-			barriers.clear();
-			recordDirty = true;
-		});
-	}
-
-	/** The world's record of the ground barriers placed (so the next session can remove them wherever they are). */
-	private static java.nio.file.Path recordFile(final MinecraftServer s) {
-		return s.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT).resolve("passthrough-ground-barriers.txt");
-	}
-
-	private static java.util.List<Long> readRecord(final MinecraftServer s) {
-		java.util.List<Long> out = new java.util.ArrayList<>();
-		try {
-			java.nio.file.Path f = recordFile(s);
-			if (java.nio.file.Files.exists(f)) {
-				for (String line : java.nio.file.Files.readAllLines(f)) {
-					if (!line.isBlank()) {
-						out.add(Long.parseLong(line.trim()));
-					}
-				}
-			}
-		} catch (Exception e) {
-			Passthrough.LOG.warn("ground: couldn't read the barrier record: {}", e.toString());
+			Passthrough.LOG.info("ground: removed {} other barriers left in the save (loaded chunks around the player)", removed);
 		}
-
-		return out;
-	}
-
-	/** Server thread: write the record (when it changed). */
-	static void writeRecord(final MinecraftServer s) {
-		if (!recordDirty) {
-			return;
-		}
-
-		recordDirty = false;
-		StringBuilder b = new StringBuilder();
-		for (BlockPos p : barriers) {
-			b.append(p.asLong()).append(System.lineSeparator());
-		}
-
-		try {
-			java.nio.file.Files.writeString(recordFile(s), b);
-		} catch (Exception e) {
-			Passthrough.LOG.warn("ground: couldn't write the barrier record: {}", e.toString());
-		}
+		placingGround = false;
 	}
 
 	/**
 	 * /hs clean (server thread): every block within `radius` (horizontally) of `centre` that isn't the host's ground
 	 * goes — the world is void, so that is everything built or left behind — and so do loose items, arrows, TNT and
-	 * falling blocks. Then the ground comes back whole ({@link #restoreGround}). Returns the blocks removed.
+	 * falling blocks. Then the host sends its ground again ({@link #restoreGround}). Returns the blocks removed.
 	 */
 	public static int clean(final ServerLevel level, final BlockPos centre, final int radius) {
 		java.util.List<BlockPos> gone = new java.util.ArrayList<>();
@@ -262,7 +167,7 @@ public final class WorldBridge {
 								p.set((cx << 4) + x, baseY + y, (cz << 4) + z);
 								int dx = p.getX() - centre.getX(), dz = p.getZ() - centre.getZ();
 								BlockState state = sections[i].getBlockState(x, y, z);
-								if (dx * dx + dz * dz <= radius * radius && !state.isAir() && !state.is(Blocks.BARRIER) && !Nether.isGround(p)) {
+								if (dx * dx + dz * dz <= radius * radius && !state.isAir() && !Nether.isGround(p)) {
 									gone.add(p.immutable());
 								}
 							}
@@ -280,27 +185,64 @@ public final class WorldBridge {
 		level.getEntities((Entity) null, box, e -> e instanceof net.minecraft.world.entity.item.ItemEntity || e instanceof AbstractArrow
 			|| e instanceof net.minecraft.world.entity.item.PrimedTnt || e instanceof net.minecraft.world.entity.item.FallingBlockEntity
 			|| e instanceof net.minecraft.world.entity.ExperienceOrb).forEach(Entity::discard);
-		restoreGround(level);
+		restoreGround();
 		return gone.size();
 	}
 
+	/** Blocks the Willies are wearing down: how far each is gone (0..1) and the game time it was last hit. Server thread. */
+	private static final Map<BlockPos, double[]> mining = new java.util.HashMap<>();
+
 	/**
-	 * Barriers of the host's ground that were broken come back (server thread), and the host sends its ground again
-	 * for the places that never had one (a block was there first). Returns the barriers put back.
+	 * {"t":"mine","c":[x,y,z],"v":m/s}: a Willie's weapon, fist or foot hit this block that hard. It wears down by that
+	 * over its hardness - a good blow breaks dirt or glass, stone and planks take a few, obsidian dozens, bedrock never -
+	 * with the cracks showing, and breaks with its drops. The wear goes after 5 s without a hit.
 	 */
-	public static int restoreGround(final ServerLevel level) {
-		int back = 0;
-		placingGround = true;
-		for (BlockPos pos : barriers) {
-			if (level.getBlockState(pos).isAir() && !BarrierOverrides.suppressed(pos)) {
-				level.setBlock(pos, Blocks.BARRIER.defaultBlockState(), Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
-				back++;
-			}
+	public static void mine(final int x, final int y, final int z, final double speed) {
+		MinecraftServer s = server;
+		double strength = HsConfig.mining();
+		if (s == null || strength <= 0.0) {
+			return;
 		}
 
-		placingGround = false;
+		s.execute(() -> {
+			ServerLevel level = s.overworld();
+			long now = level.getGameTime();
+			mining.entrySet().removeIf(e -> {
+				boolean old = now - (long) e.getValue()[1] > 100;
+				if (old) {
+					level.destroyBlockProgress(crackId(e.getKey()), e.getKey(), -1);
+				}
+
+				return old;
+			});
+			BlockPos pos = new BlockPos(x, y, z);
+			BlockState state = level.getBlockState(pos);
+			float hardness = state.getDestroySpeed(level, pos);
+			if (state.isAir() || hardness < 0.0F || state.getBlock() instanceof net.minecraft.world.level.block.LiquidBlock) {
+				return;
+			}
+
+			double[] wear = mining.computeIfAbsent(pos.immutable(), p -> new double[2]);
+			wear[0] += speed * strength / (hardness * 8.0 + 1.0);
+			wear[1] = now;
+			if (wear[0] >= 1.0) {
+				mining.remove(pos);
+				level.destroyBlockProgress(crackId(pos), pos, -1);
+				level.destroyBlock(pos, true);
+			} else {
+				level.destroyBlockProgress(crackId(pos), pos, (int) (wear[0] * 10.0));
+			}
+		});
+	}
+
+	/** The cracks' "breaker" for a block the Willies wear (never an entity's id: those are positive). */
+	private static int crackId(final BlockPos pos) {
+		return -1 - (pos.hashCode() & 0x3FFFFFFF);
+	}
+
+	/** The host scans its ground and sends it all again (/hs fixground, /hs clean). */
+	public static void restoreGround() {
 		Passthrough.events.accept("{\"t\":\"resample\"}");
-		return back;
 	}
 
 	/** Run a command as the server (op). Results go to the log, not to chat (send_command_feedback is off). */
@@ -335,6 +277,22 @@ public final class WorldBridge {
 
 		holdTicks = HOLD_MAX_TICKS;
 		Passthrough.LOG.info("holding the player until the host's ground is in");
+	}
+
+	/** {"t":"hover","on":..}: nothing under the player in the host's world yet (its map loading there): held up till there is. */
+	public static void hover(final boolean on) {
+		MinecraftServer s = server;
+		if (s == null) {
+			return;
+		}
+
+		s.execute(() -> {
+			if (on) {
+				startHold(s);
+			} else {
+				endHold(s, "the host's ground is under him now");
+			}
+		});
 	}
 
 	private static void endHold(final MinecraftServer s, final String why) {
@@ -377,7 +335,7 @@ public final class WorldBridge {
 
 	private static boolean solidForHost(final ServerLevel level, final BlockPos pos, final BlockState state) {
 		// the Nether's ground is the host's own ground turned: nothing to collide with that isn't there already
-		return !state.isAir() && !state.is(Blocks.BARRIER) && !state.getCollisionShape(level, pos).isEmpty() && !Nether.isGround(pos);
+		return !state.isAir() && !state.getCollisionShape(level, pos).isEmpty() && !Nether.isGround(pos);
 	}
 
 	/** Arrows the host already hit something with (they stay where they hit and aren't reported again). */
@@ -387,17 +345,6 @@ public final class WorldBridge {
 	static void tick(final MinecraftServer s) {
 		flush(s);
 		hold(s);
-		if (++reportTicks >= 100) {
-			reportTicks = 0;
-			if (barriersPlaced > 0 || barriersRemoved > 0) {
-				Passthrough.LOG.info("ground barriers: {} placed, {} removed in 5 s ({} now)", barriersPlaced, barriersRemoved, barriers.size());
-				barriersPlaced = barriersRemoved = 0;
-			}
-
-			if (legacyCleaned) {
-				writeRecord(s); // (every 5 s at most: a crash then leaves little behind)
-			}
-		}
 		if (Passthrough.active) {
 			reportProjectiles(s.overworld());
 			s.getPlayerList().getPlayers().forEach(HostGround::unstuck);

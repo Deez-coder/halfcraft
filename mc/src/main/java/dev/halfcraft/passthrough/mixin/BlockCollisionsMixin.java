@@ -30,12 +30,8 @@ abstract class BlockCollisionsMixin {
 			return shape;
 		}
 
-		if (HostGround.exactInstead(state, cell)) {
-			return cell.shape(); // our barrier in a partial cell (support for torches...): the slope's own shape
-		}
-
 		if (shape == Shapes.block()) {
-			return shape; // (a whole block already: the barrier itself, usually)
+			return shape; // (a whole block already)
 		}
 
 		return shape.isEmpty() ? cell.shape() : Shapes.or(shape, cell.shape());

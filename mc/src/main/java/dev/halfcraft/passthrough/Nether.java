@@ -257,13 +257,14 @@ public final class Nether {
 		}
 	}
 
-	/** One column of the host's ground (its top barrier, near the portal's height) turns to the Nether. */
+	/** One column of the host's ground (its top solid cell, near the portal's height) turns to the Nether. */
 	private static void turn(final ServerLevel level, final int x, final int z) {
 		BlockPos.MutableBlockPos p = new BlockPos.MutableBlockPos();
 		int top = Integer.MIN_VALUE;
 		for (int y = bottomY + 5; y >= bottomY - 12; y--) {
 			p.set(x, y, z);
-			if (level.getBlockState(p).is(Blocks.BARRIER) && level.getBlockState(p.above()).isAir()) {
+			if (HostGround.solidAir(level, p, level.getBlockState(p)) && level.getBlockState(p.above()).isAir()
+				&& !HostGround.solidAir(level, p.above(), level.getBlockState(p.above()))) {
 				top = y;
 				break;
 			}
@@ -522,7 +523,7 @@ public final class Nether {
 	/** A block of the host's ground the Nether turned (netherrack, lava, ...: not something to collide with). */
 	static boolean isGround(final BlockPos pos) {
 		BlockState before = changed.get(pos);
-		return before != null && before.is(Blocks.BARRIER);
+		return before != null && before.isAir() && HostGround.cellAt(pos) != null;
 	}
 
 	/** The host (re)connected: tell it again that the Nether is open, and where every hot block is. */

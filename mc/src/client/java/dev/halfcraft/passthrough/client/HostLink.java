@@ -83,9 +83,12 @@ public final class HostLink extends WebSocketServer {
 					JsonArray from = m.has("from") ? m.getAsJsonArray("from") : null;
 					WorldBridge.hurtPlayer(m.get("d").getAsFloat(), from == null ? null : new double[] {from.get(0).getAsDouble(), from.get(1).getAsDouble(), from.get(2).getAsDouble()});
 				}
-				case "ground" -> WorldBridge.solid(ints(m.getAsJsonArray("c")));
 				case "vox" -> dev.halfcraft.passthrough.HostGround.cells(m.getAsJsonArray("c"));
-				case "map" -> dev.halfcraft.passthrough.BarrierOverrides.onMap(m.get("name").getAsString(), m.get("off").getAsDouble());
+				case "hover" -> WorldBridge.hover(m.get("on").getAsBoolean());
+				case "mine" -> {
+					JsonArray c = m.getAsJsonArray("c");
+					WorldBridge.mine(c.get(0).getAsInt(), c.get(1).getAsInt(), c.get(2).getAsInt(), m.get("v").getAsDouble());
+				}
 				case "clear" -> {
 					WorldBridge.clearSolid();
 					dev.halfcraft.passthrough.HostGround.clear();
@@ -153,14 +156,5 @@ public final class HostLink extends WebSocketServer {
 	@Override
 	public void onError(final WebSocket conn, final Exception e) {
 		Passthrough.LOG.warn("host link error", e);
-	}
-
-	private static int[] ints(final JsonArray a) {
-		int[] out = new int[a.size()];
-		for (int i = 0; i < out.length; i++) {
-			out[i] = a.get(i).getAsInt();
-		}
-
-		return out;
 	}
 }

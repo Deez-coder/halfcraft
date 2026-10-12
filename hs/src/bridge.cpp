@@ -89,6 +89,7 @@ namespace
 		int fps = 0; // Half Sword's frame cap (/hs fps, 0 = none): what it leaves of the GPU, Minecraft gets
 		bool balance = true; // cap Half Sword a little above Minecraft's rate (Minecraft does the same the other way)
 		double props = 1.0;  // how hard Steve's blows push loose things (/hs props)
+		double current = 1.0; // how hard water's and lava's currents push the fighters (/hs current)
 	} g_cfg;
 	int g_fpsApplied = 0;
 	// Minecraft's frame rate, from the export's publish counter (for the balance)
@@ -222,6 +223,9 @@ namespace
 	constexpr double kRodPull = 1.6;    // a fishing rod's yank: x Minecraft's pull
 	constexpr double kWindPush = 1.0;      // wind charges, Wind Burst, a mace's shockwave: Minecraft's push as it is
 	constexpr double kMaxPush = 1600.0;    // cm/s: past this a ragdoll just comes apart
+	constexpr double kChargeShove = 70.0;     // cm/s of whole-body shove per m/s of a spear charge
+	constexpr double kMaxChargeShove = 1100.0;
+	constexpr double kChargeFloors = 7.0;     // m/s: a charge this fast (a horse's) takes him off his feet
 	constexpr double kPlayerKnockbackPerLevel = 180.0; // cm/s of whole-body shove per level of Knockback / Punch
 	struct MobBody
 	{
@@ -516,12 +520,24 @@ namespace
 	constexpr int kCellsAbove = 12;           // and above
 	constexpr int kRescanCells = 3;           // Steve this many cells up or down from a column's scan: scan it again
 	constexpr double kScanBudgetMs = 2.0;     // tracing per tick
+	constexpr double kScanRushMs = 8.0;       // while a column this close to Steve isn't in (he'd fall through it)
+	constexpr int kNearCells = 3;
+	constexpr ULONGLONG kEmptyRetryMs = 1000; // a column with nothing in it (its part of the map not loaded yet?): again after,
+	constexpr int kNearRetryCells = 8;        // this close to Steve (outside the map's edge, nothing ever comes: not so often)
+	constexpr ULONGLONG kFarEmptyRetryMs = 10000;
 	constexpr int kMaxTraces = 24;            // per sub-column
 	constexpr double kMergeGapCm = 60.0;      // a gap under a floor thinner than this is closed (nothing fits in it)
 	constexpr int kNearlyWholeLow = 426;      // of a cell's 448 1/8 cubes in its bottom 7 layers: counts as a whole cell
 	constexpr int kSupportLayers = 4;         // a ground surface cell this many 1/8 layers up (median) gets a support barrier
 	constexpr double kOpenSolidCm = 150.0;    // a one-sided surface this close over the next: solid between them
 	constexpr double kOpenThinCm = 25.0;      // else it's taken to be this thick
+
+	// the map just loaded or dropped a piece (a big one like Abyss swaps them as the player goes): for a moment a piece
+	// can be gone before the one replacing it is in. Meanwhile the ground right under Steve isn't taken away (he fell
+	// through it and was lifted back up); it's looked at again after
+	constexpr ULONGLONG kStreamGuardMs = 3000;
+	ULONGLONG g_mapChangedAt = 0;
+	int g_guardX = 0, g_guardY = 0, g_guardZ = 0; // Steve's cell
 
 	struct ScannedColumn
 	{
@@ -919,10 +935,14 @@ namespace
 			std::nth_element(heights, heights + 32, heights + 64);
 			surfaceSupport = heights[32] >= kSupportLayers;
 		}
+		const bool guard = GetTickCount64() - g_mapChangedAt < kStreamGuardMs && std::abs(x - g_guardX) <= 2 && std::abs(z - g_guardZ) <= 2;
+		bool kept = false;
 		for (int y = y0; y <= y1; ++y)
 		{
 			const int c = counts[y - y0];
-			if (c == 0)
+			if (c == 0 && guard && y <= g_guardY && y >= g_guardY - 3 && g_sentCells.count(cell_key(x, y, z)))
+				kept = true; // (under Steve while the map swaps pieces: kept for now)
+			else if (c == 0)
 				send_cell(x, y, z, nullptr, false);
 			else if (c < 512)
 				send_cell(x, y, z, masks[y - y0], false, y == surface && surfaceSupport);
@@ -935,12 +955,33 @@ namespace
 					send_cell(x, y, z, nullptr, true);
 			}
 		}
+		if (kept)
+		{
+			col.empty = true; // (looked at again in a second: then it goes, if it's still not there)
+			col.at = GetTickCount64();
+		}
 		return true;
 	}
 
-	/// Scan the columns around `feet` (UE) that need it, nearest first, for kScanBudgetMs.
+	/// Scan the columns around `feet` (UE) that need it, nearest first, for kScanBudgetMs (more while the ones right
+	/// around him aren't in: he'd fall through).
 	void sample_ground(SDK::UWorld *world, const SDK::FVector &feet)
 	{
+		// a big map (Abyss) loads its ground in pieces around the player as he goes: a piece coming (or going) is looked
+		// at again, nearest first (only what changed is sent). Columns scanned before their piece was in found nothing,
+		// or less than is there now: the ground had stopped further out until /hs fixground
+		static int levelsSeen = -1;
+		const int levels = world->Levels.Num();
+		if (levels != levelsSeen)
+		{
+			if (levelsSeen >= 0)
+			{
+				g_scanned.clear();
+				g_mapChangedAt = GetTickCount64();
+				hslog::info("ground: the map has %d pieces loaded now (was %d): scanning again", levels, levelsSeen);
+			}
+			levelsSeen = levels;
+		}
 		if (g_spiral.empty())
 		{
 			for (int dx = -kVoxRadius; dx <= kVoxRadius; ++dx)
@@ -954,35 +995,59 @@ namespace
 		LARGE_INTEGER freq, t0, now;
 		QueryPerformanceFrequency(&freq);
 		QueryPerformanceCounter(&t0);
-		const long long budget = static_cast<long long>(freq.QuadPart * kScanBudgetMs / 1000.0);
 		// Minecraft column (x, z) covers UE x in [x, x+1) m and UE y in [z, z+1) m
 		const int px = int(std::floor(feet.X / 100.0)), pz = int(std::floor(feet.Y / 100.0));
 		const int refY = int(std::floor(feet.Z / 100.0 + g_yOffset));
 		const ULONGLONG tick = GetTickCount64();
+		g_guardX = px;
+		g_guardY = refY;
+		g_guardZ = pz;
+		auto needs = [&](int x, int z) {
+			auto it = g_scanned.find(column_key(x, z));
+			if (it == g_scanned.end())
+				return true;
+			if (!it->second.empty)
+				return std::abs(it->second.refY - refY) >= kRescanCells;
+			const bool close = std::abs(x - px) <= kNearRetryCells && std::abs(z - pz) <= kNearRetryCells;
+			return tick - it->second.at >= (close ? kEmptyRetryMs : kFarEmptyRetryMs);
+		};
+		bool nearMissing = false;
+		for (int dx = -kNearCells; dx <= kNearCells && !nearMissing; ++dx)
+			for (int dz = -kNearCells; dz <= kNearCells && !nearMissing; ++dz)
+				nearMissing = needs(px + dx, pz + dz);
+		const long long budget = static_cast<long long>(freq.QuadPart * (nearMissing ? kScanRushMs : kScanBudgetMs) / 1000.0);
 		static int scannedThisSecond = 0, slowColumns = 0;
 		static ULONGLONG statsAt = 0;
 		for (const auto &[dx, dz] : g_spiral)
 		{
 			const int x = px + dx, z = pz + dz;
 			const int64_t key = column_key(x, z);
-			auto it = g_scanned.find(key);
-			if (it != g_scanned.end())
-			{
-				const ScannedColumn &c = it->second;
-				if (c.empty ? tick - c.at < 30000 : std::abs(c.refY - refY) < kRescanCells)
-					continue;
-			}
+			if (!needs(x, z))
+				continue;
 			QueryPerformanceCounter(&now);
 			if (now.QuadPart - t0.QuadPart > budget)
 				break;
 			ScannedColumn col;
 			col.refY = refY;
 			col.at = tick;
-			col.empty = !scan_column(world, x, z, refY, col);
+			if (!scan_column(world, x, z, refY, col))
+				col.empty = true;
 			g_scanned[key] = col;
 			++scannedThisSecond;
 		}
 		flush_vox();
+		// nothing at all under Steve, as far down as 200 m (his part of the map isn't loaded yet; ground just further down
+		// than the scan reaches is a fall): Minecraft holds him up until there is
+		static bool hovering = false;
+		auto own = g_scanned.find(column_key(px, pz));
+		double below = 0.0;
+		const bool hover = own != g_scanned.end() && own->second.empty && !ground_z(world, feet.X, feet.Y, feet.Z + 50.0, below);
+		if (hover != hovering)
+		{
+			hovering = hover;
+			g_ws.send(hover ? "{\"t\":\"hover\",\"on\":true}" : "{\"t\":\"hover\",\"on\":false}");
+			hslog::info("ground: nothing under Steve at %d, %d: %s", px, pz, hover ? "held up" : "there is now");
+		}
 		if (tick - statsAt >= 5000)
 		{
 			if (scannedThisSecond > 0)
@@ -1338,6 +1403,11 @@ namespace
 		const double smash = json_num(m, "smash", 0.0);
 		if (smash > 0.0)
 			speed = std::clamp(1800.0 + 110.0 * smash, 1800.0, 6000.0);
+		// a spear's charge: how fast Steve came on (m/s: ~5.6 sprinting, ~14 on a horse) past the cap too
+		const double charge = json_num(m, "charge", 0.0);
+		if (charge > 0.0)
+			speed = std::clamp(1500.0 + 300.0 * charge, 1500.0, 6000.0);
+		const bool spear = item.size() > 6 && item.compare(item.size() - 6, 6, "_spear") == 0;
 		if (thrown)
 		{
 		}
@@ -1348,11 +1418,14 @@ namespace
 		}
 		else if (kind == "player")
 		{
-			// every Minecraft weapon, fists, blocks, tools: blunt, like a pommel or a club
-			SDK::UPrimitiveComponent *by = g_blade.pommel;
+			// every Minecraft weapon, fists, blocks, tools: blunt, like a pommel or a club; a spear stabs, as an arrow
+			SDK::UPrimitiveComponent *by = spear && g_blade.head != nullptr ? g_blade.head : g_blade.pommel;
 			if (by == nullptr && g_standIn.ref.alive())
 				by = as_willie(g_standIn.ref.obj)->Mesh;
-			strike_fighter(w, bone, at, dir, speed, 0.0, 0.0, 1.1, 0, crit, by != nullptr ? by : w->Mesh, nullptr, item.empty() ? "fist" : item.c_str());
+			if (spear)
+				strike_fighter(w, bone, at, dir, speed, 15.0, 0.6, 0.4, 0, crit, by != nullptr ? by : w->Mesh, nullptr, item.c_str());
+			else
+				strike_fighter(w, bone, at, dir, speed, 0.0, 0.0, 1.1, 0, crit, by != nullptr ? by : w->Mesh, nullptr, item.empty() ? "fist" : item.c_str());
 		}
 		else
 		{
@@ -1383,6 +1456,20 @@ namespace
 		// Minecraft's knockback, on top of Half Sword's own reaction
 		const double push = std::min(points * 40.0 * (crit ? 1.5 : 1.0), kMaxPush);
 		w->Mesh->AddImpulse(SDK::FVector(dir.X * push, dir.Y * push, std::max(dir.Z, 0.15) * push), bone, true);
+		// a spear's charge throws him back the way Steve came, his whole body; at a gallop it takes him off his feet
+		if (charge > 0.0)
+		{
+			const int handle = int(json_num(m, "h", -1));
+			const double h = std::sqrt(dir.X * dir.X + dir.Y * dir.Y), shove = std::min(kChargeShove * charge, kMaxChargeShove);
+			if (h > 1e-3)
+				w->Mesh->AddImpulseToAllBodiesBelow(SDK::FVector(dir.X / h * shove, dir.Y / h * shove, shove * 0.15), name(L"pelvis"), true, true);
+			if (charge >= kChargeFloors)
+			{
+				w->Force_Fall = true;
+				g_fallUntil[handle] = GetTickCount64() + 1500;
+			}
+			hslog::info("spear charge on fighter %d: %.1f m/s, %.1f Minecraft damage", handle, charge, points);
+		}
 		// a real smash (3 blocks and more) floors him
 		if (smash >= 12.0)
 		{
@@ -1561,8 +1648,9 @@ namespace
 		const double before = w->Health;
 		const std::string kind = json_str(m, "k");
 		const double points = json_num(m, "d");
-		// (its own multiplier, /hs potions: /hs dealt is for blows)
-		const double lost = std::min(points * kMagicPerPoint, kind == "harming" ? kMaxHarm : kMaxTick) * g_cfg.potions;
+		// potions: their own multiplier (/hs potions: /hs dealt is for blows); drowning and freezing aren't potions
+		const bool potion = kind == "harming" || kind == "poison" || kind == "wither";
+		const double lost = potion ? std::min(points * kMagicPerPoint, kind == "harming" ? kMaxHarm : kMaxTick) * g_cfg.potions : points * kHealthPerPoint;
 		const bool nokill = json_bool(m, "nokill");
 		w->Health = nokill ? std::max(std::min(before, kPoisonFloor), before - lost) : before - lost;
 		// sick: it saps him a little too
@@ -1595,6 +1683,13 @@ namespace
 		}
 	}
 
+	constexpr double kWaterLift = 490.0;    // cm/s2 up on a fighter wholly in water (half of gravity: he still sinks, slowly)
+	constexpr double kLiquidCurrent = 650.0; // cm/s2 along the current, in it to the hips (/hs current scales it)
+	constexpr double kFrozenStaminaDrain = 25.0; // stamina a second, frozen through
+	constexpr double kWaterDrag = 2.5;      // of his body's speed, the share lost per second (all under)
+	constexpr double kSnowDrag = 9.0;       // powder snow: nearly held
+	constexpr double kLavaDrag = 5.0;
+
 	/// What Minecraft's effects do to a fighter while they last (levels from 1; 0 = none).
 	struct Effects
 	{
@@ -1605,6 +1700,117 @@ namespace
 		float dilation = 1.0f;                        // what was set on him
 	};
 	std::unordered_map<int, Effects> g_effects; // fighter handle -> his effects
+
+	/// How much of a fighter's body is in Minecraft's water, powder snow and lava (0..1), and the water's current there.
+	struct Surroundings
+	{
+		double water = 0.0, snow = 0.0, lava = 0.0, flowX = 0.0, flowZ = 0.0, frozen = 0.0;
+		bool drowning = false;
+		ULONGLONG until = 0;
+		float walkSpeed = 0.0f; // his own walking speed (what's put back when he's out)
+		bool choking = false;   // his throat set held (drowning): let go when he's out
+	};
+
+	/// Drowning is Half Sword's own choking: his throat "held" (Willie_BP eases Strangle_Rate up from it, which lowers
+	/// his consciousness's cap and builds Choke_To_Death_Rate: he blacks out, then dies of it), or let go.
+	void set_choking(SDK::AWillie_BP_C *w, Surroundings &s, bool on)
+	{
+		if (on == s.choking)
+			return;
+		w->My_Throat_Is_Held_R = on;
+		w->My_Throat_Is_Held_L = on;
+		s.choking = on;
+	}
+	std::unordered_map<int, Surroundings> g_surroundings; // fighter handle -> what he's in
+
+	/// {"t":"env","f":[handle, water, snow, lava, flow x, flow z, drowning, frozen, ...]} (Minecraft's blocks, every 2
+	/// ticks while any is in some; an empty list once after).
+	void on_env(const std::string &m)
+	{
+		const ULONGLONG now = GetTickCount64();
+		double v[1024];
+		const int n = json_nums(m, "f", v, 1024);
+		for (int i = 0; i + 7 < n; i += 8)
+		{
+			Surroundings &s = g_surroundings[int(v[i])];
+			if (s.until < now)
+				hslog::info("fighter %d in Minecraft's %s", int(v[i]), v[i + 3] > 0.0 ? "lava" : v[i + 1] > 0.0 ? "water" : "powder snow");
+			s.water = v[i + 1];
+			s.snow = v[i + 2];
+			s.lava = v[i + 3];
+			s.flowX = v[i + 4];
+			s.flowZ = v[i + 5];
+			if ((v[i + 6] != 0.0) != s.drowning)
+				hslog::info("fighter %d %s", int(v[i]), v[i + 6] != 0.0 ? "is out of air: choking" : "breathes again");
+			s.drowning = v[i + 6] != 0.0;
+			s.frozen = v[i + 7];
+			s.until = now + 400;
+		}
+	}
+
+	/// Every tick: what Minecraft's water, powder snow and lava do to the fighters in them. He walks slower (water a
+	/// half, lava more, powder snow nearly holds him), his body drags in it (its speed bleeds away), water carries him a
+	/// little and its current pushes him. (Burning and drowning are Minecraft's: "burn", "magic".)
+	void apply_surroundings()
+	{
+		const ULONGLONG now = GetTickCount64();
+		static ULONGLONG last = now;
+		const double dt = std::min(0.1, (now - last) / 1000.0);
+		last = now;
+		for (auto it = g_surroundings.begin(); it != g_surroundings.end();)
+		{
+			Surroundings &s = it->second;
+			auto *w = fighter_by_handle(it->first);
+			if (w == nullptr || now > s.until || w->DED)
+			{
+				if (w != nullptr && s.walkSpeed > 0.0f && w->CharacterMovement != nullptr)
+					w->CharacterMovement->MaxWalkSpeed = s.walkSpeed;
+				if (w != nullptr)
+					set_choking(w, s, false);
+				it = g_surroundings.erase(it);
+				continue;
+			}
+			++it;
+			set_choking(w, s, s.drowning);
+			// frozen through: the cold saps him (slow, heavy, out of breath)
+			if (s.frozen >= 1.0)
+				w->Stamina = std::max(0.0, w->Stamina - kFrozenStaminaDrain * dt);
+			const double snow = std::min(1.0, s.snow * 2.0); // (sunk to the knees is held fast already)
+			const double slow = (1.0 - 0.5 * s.water) * (1.0 - 0.8 * snow) * (1.0 - 0.7 * std::min(1.0, s.lava * 2.0));
+			if (w->CharacterMovement != nullptr)
+			{
+				if (s.walkSpeed <= 0.0f)
+					s.walkSpeed = w->CharacterMovement->MaxWalkSpeed;
+				w->CharacterMovement->MaxWalkSpeed = float(s.walkSpeed * slow);
+			}
+			if (w->Mesh == nullptr || dt <= 0.0)
+				continue;
+			// drag: this share of his body's speed goes each second (per second, not per frame)
+			const double drag = kWaterDrag * s.water + kSnowDrag * snow + kLavaDrag * s.lava;
+			const SDK::FVector v = w->Mesh->GetPhysicsLinearVelocity(name(L"pelvis"));
+			const double keep = std::exp(-drag * dt);
+			SDK::FVector change(-v.X * (1.0 - keep), -v.Y * (1.0 - keep), -v.Z * (1.0 - keep) * 0.5);
+			// water carries him a little (half his weight, all under); a current (water's or lava's) pushes him along
+			const double current = kLiquidCurrent * g_cfg.current * std::min(1.0, (s.water + s.lava) * 2.0);
+			change.X += s.flowX * current * dt;
+			change.Y += s.flowZ * current * dt;
+			change.Z += kWaterLift * s.water * dt;
+			w->Mesh->AddImpulseToAllBodiesBelow(change, name(L"pelvis"), true, true);
+		}
+	}
+
+	/// Minecraft stops driving: the fighters walk at their own speed again.
+	void clear_surroundings()
+	{
+		for (auto &[handle, s] : g_surroundings)
+			if (auto *w = fighter_by_handle(handle); w != nullptr)
+			{
+				if (s.walkSpeed > 0.0f && w->CharacterMovement != nullptr)
+					w->CharacterMovement->MaxWalkSpeed = s.walkSpeed;
+				set_choking(w, s, false);
+			}
+		g_surroundings.clear();
+	}
 
 	/// How hard a fighter hits, by his effects: Minecraft's Strength (+3 a level on a 1-point fist, here a share) and
 	/// Weakness (-4 a level).
@@ -1719,6 +1925,7 @@ namespace
 			show_body(e);
 		}
 		g_effects.clear();
+		clear_surroundings();
 	}
 
 
@@ -1772,6 +1979,7 @@ namespace
 		g_cfg.fps = int(json_num(m, "fps", 0.0));
 		g_cfg.balance = json_num(m, "balance", 1.0) != 0.0;
 		g_cfg.props = json_num(m, "props", 1.0);
+		g_cfg.current = json_num(m, "current", 1.0);
 		hslog::info("damage settings: dealt x%.2f taken x%.2f potions x%.2f head %.2f neck %.2f torso %.2f arms %.2f legs %.2f", g_cfg.dealt, g_cfg.taken, g_cfg.potions,
 			g_cfg.part[kHead], g_cfg.part[kNeck], g_cfg.part[kTorso], g_cfg.part[kArms], g_cfg.part[kLegs]);
 	}
@@ -3242,6 +3450,7 @@ namespace
 	// ---- Steve's blows on Half Sword's loose things ----
 	constexpr double kPropImpulse = 4000.0; // kg cm/s a full blow gives (a 10 kg candle stand: 4 m/s)
 	constexpr double kPropMaxSpeed = 1200.0; // cm/s, the most a full blow gives something light (a weapon, a chain link)
+	constexpr float kPropBehind = 20.0f;     // cm: a loose thing this far behind the first thing hit (the floor it lies on) still is
 
 	/// {"t":"swing","o":[eyes],"d":[look],"r":reach,"s":charge}: Steve swung at no mob or fighter. The first thing on that
 	/// line, as far as he reaches: if it's loose (simulating physics: a candle stand, a chain, a weapon on the floor, not a
@@ -3260,19 +3469,33 @@ namespace
 			return;
 		dir = SDK::FVector(dir.X / len, dir.Y / len, dir.Z / len);
 		const SDK::FVector to(from.X + dir.X * reach, from.Y + dir.Y * reach, from.Z + dir.Z * reach);
-		SDK::EObjectTypeQuery types[] = {SDK::EObjectTypeQuery::ObjectTypeQuery1, SDK::EObjectTypeQuery::ObjectTypeQuery2,
-			SDK::EObjectTypeQuery::ObjectTypeQuery4, SDK::EObjectTypeQuery::ObjectTypeQuery6}; // static, dynamic, physics bodies, destructibles
-		SDK::TArray<SDK::EObjectTypeQuery> typeArray(types, 4, 4);
+		// everything (the map, its blocks, loose things), and loose things alone: Half Sword's weapons are of its own
+		// collision types (custom ones: ObjectTypeQuery7 on), and one lying on the floor is reached by the floor first -
+		// it still counts when it's no further than kPropBehind past the first thing hit
+		using Q = SDK::EObjectTypeQuery;
+		Q all[] = {Q::ObjectTypeQuery1, Q::ObjectTypeQuery2, Q::ObjectTypeQuery4, Q::ObjectTypeQuery6, Q::ObjectTypeQuery7, Q::ObjectTypeQuery8,
+			Q::ObjectTypeQuery9, Q::ObjectTypeQuery10, Q::ObjectTypeQuery11, Q::ObjectTypeQuery12};
+		Q loose[] = {Q::ObjectTypeQuery2, Q::ObjectTypeQuery4, Q::ObjectTypeQuery6, Q::ObjectTypeQuery7, Q::ObjectTypeQuery8, Q::ObjectTypeQuery9,
+			Q::ObjectTypeQuery10, Q::ObjectTypeQuery11, Q::ObjectTypeQuery12};
+		SDK::TArray<Q> allTypes(all, 10, 10), looseTypes(loose, 9, 9);
 		SDK::AActor *skip[1] = {g_standIn.ref.alive() ? static_cast<SDK::AActor *>(g_standIn.ref.obj) : nullptr};
 		SDK::TArray<SDK::AActor *> ignore(skip, skip[0] != nullptr ? 1 : 0, 1);
-		SDK::FHitResult hit{};
-		if (!SDK::UKismetSystemLibrary::SphereTraceSingleForObjects(world, from, to, 8.0f, typeArray, false, ignore, SDK::EDrawDebugTrace::None, &hit, true,
-				SDK::FLinearColor{}, SDK::FLinearColor{}, 0.0f) || !hit.bBlockingHit)
+		auto pushable = [](const SDK::FHitResult &h) {
+			SDK::UPrimitiveComponent *pc = h.Component.Get();
+			return pc != nullptr && as_willie(pc->GetOwner()) == nullptr && pc->IsSimulatingPhysics(h.BoneName); // (a fighter's hits go through his proxy)
+		};
+		SDK::FHitResult first{}, hit{};
+		const bool any = SDK::UKismetSystemLibrary::SphereTraceSingleForObjects(world, from, to, 8.0f, allTypes, false, ignore, SDK::EDrawDebugTrace::None,
+							 &first, true, SDK::FLinearColor{}, SDK::FLinearColor{}, 0.0f) && first.bBlockingHit;
+		if (!any)
 			return;
+		if (pushable(first))
+			hit = first;
+		else if (!(SDK::UKismetSystemLibrary::SphereTraceSingleForObjects(world, from, to, 8.0f, looseTypes, false, ignore, SDK::EDrawDebugTrace::None, &hit,
+					   true, SDK::FLinearColor{}, SDK::FLinearColor{}, 0.0f) && hit.bBlockingHit && pushable(hit) && hit.Distance <= first.Distance + kPropBehind))
+			return; // a wall, a block, the floor
 		SDK::UPrimitiveComponent *c = hit.Component.Get();
-		SDK::AActor *owner = c != nullptr ? c->GetOwner() : nullptr;
-		if (c == nullptr || as_willie(owner) != nullptr || !c->IsSimulatingPhysics(hit.BoneName))
-			return; // a wall, a block, the floor, a fighter (his hits go through his proxy)
+		SDK::AActor *owner = c->GetOwner();
 		const double mass = std::max(double(c->GetMass()), 0.2);
 		const double k = g_cfg.props * (0.2 + 0.8 * charge * charge); // Minecraft's own: an uncharged blow is a fifth
 		const double speed = std::min(kPropImpulse * k / mass, kPropMaxSpeed * k);
@@ -3316,6 +3539,8 @@ namespace
 			on_heal(m);
 		else if (t == "fx")
 			on_fx(m);
+		else if (t == "env")
+			on_env(m);
 		else if (t == "mobs")
 			on_mobs(world, m);
 		else if (t == "push")
@@ -3348,17 +3573,11 @@ namespace
 		g_haveOffset = true;
 		reset_ground();
 		g_ws.send("{\"t\":\"clear\"}");
-		// which map, and how its heights line up with Minecraft's now (the player's own barrier changes are kept per
-		// map, in the map's own heights: /hs barriers)
-		{
-			char mapMsg[256];
-			snprintf(mapMsg, sizeof(mapMsg), "{\"t\":\"map\",\"name\":\"%s\",\"off\":%.4f}", world != nullptr ? world->GetName().c_str() : "?", g_yOffset);
-			g_ws.send(mapMsg);
-		}
 		g_startFeet = SDK::FVector(feet.X, feet.Y, groundZ);
 		g_tpIn = 15; // the ground around the start streams in first
 		move_blocks();
-		hslog::info("levelled: ground z %.1f cm -> y %.0f (offset %.3f)", groundZ, kGroundLevel, g_yOffset);
+		hslog::info("levelled on %s: ground z %.1f cm -> y %.0f (offset %.3f)", world != nullptr ? world->GetName().c_str() : "?", groundZ, kGroundLevel,
+			g_yOffset);
 	}
 
 	// The poses the camera actor was aimed with (newest last): the tick finds which one this frame's view used.
@@ -3502,6 +3721,7 @@ namespace
 			g_blockActor = {};
 			g_burning.clear();
 			g_effects.clear(); // (the fighters went with the old world)
+			g_surroundings.clear();
 			g_fallUntil.clear();
 			g_fireActor = {};
 			g_fireSource = nullptr;
@@ -3655,6 +3875,7 @@ namespace
 		send_fighters(world);
 		burn_fighters(world);
 		apply_effects();
+		apply_surroundings();
 		for (auto it = g_fallUntil.begin(); it != g_fallUntil.end();)
 		{
 			if (GetTickCount64() < it->second)
@@ -3740,10 +3961,54 @@ namespace bridge
 		hslog::info("bridge started, Minecraft link on 127.0.0.1:%d", kPort);
 	}
 
+	// ---- Willies mining Minecraft's blocks ----
+	constexpr double kMineWeaponSpeed = 250.0; // cm/s: a weapon this fast into a block chips it
+	constexpr double kMineBodySpeed = 450.0;   // a fist or a kick (walking into one, standing on one: slower)
+	constexpr ULONGLONG kMineCooldownMs = 200; // one blow, however many frames it touches
+	std::unordered_map<int64_t, ULONGLONG> g_minedAt;
+
+	/// A Willie's weapon, fist or foot hitting one of Minecraft's blocks (their boxes on the block actor): {"t":"mine",
+	/// "c":[x,y,z],"v":m/s} - Minecraft wears the block down by how hard, and breaks it. Not the stand-in nor a mob's
+	/// body (Steve and the mobs are Minecraft's own).
+	void note_block_hit(const void *object, const void *function, void *parms)
+	{
+		const HitEvent *e = nullptr;
+		for (const HitEvent &h : g_hitEvents)
+			if (h.fn == function)
+				e = &h;
+		if (e == nullptr || e->kind == HitKind::Overlap)
+			return;
+		auto *p = static_cast<HitParms *>(parms);
+		if (p->otherActor == nullptr || p->otherActor != g_blockActor.obj || p->hitComponent == nullptr || !g_blockActor.alive())
+			return;
+		if ((g_standInObj != nullptr && object == g_standInObj) || g_mobBodyOf.count(static_cast<const SDK::UObject *>(object)))
+			return;
+		const SDK::FVector v = p->hitComponent->GetPhysicsLinearVelocity(p->hit.MyBoneName);
+		const double speed = std::sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z);
+		if (speed < (e->kind == HitKind::Body ? kMineBodySpeed : kMineWeaponSpeed))
+			return;
+		// the block is the one behind the face that was hit
+		const SDK::FVector in(p->hit.ImpactPoint.X - p->hit.ImpactNormal.X * 5.0, p->hit.ImpactPoint.Y - p->hit.ImpactNormal.Y * 5.0,
+			p->hit.ImpactPoint.Z - p->hit.ImpactNormal.Z * 5.0);
+		double mx, my, mz;
+		to_mc(in, mx, my, mz);
+		const int bx = int(std::floor(mx)), by = int(std::floor(my)), bz = int(std::floor(mz));
+		const ULONGLONG now = GetTickCount64();
+		if (g_minedAt.size() > 4096)
+			g_minedAt.clear();
+		ULONGLONG &last = g_minedAt[cell_key(bx, by, bz)];
+		if (now - last < kMineCooldownMs)
+			return;
+		last = now;
+		sendf("{\"t\":\"mine\",\"c\":[%d,%d,%d],\"v\":%.2f}", bx, by, bz, speed / 100.0);
+	}
+
 	bool filter_event(const void *object, const void *function, void *parms)
 	{
 		if (block_script(object, function, parms))
 			return true;
+		if (parms != nullptr && g_blockActor.obj != nullptr)
+			note_block_hit(object, function, parms);
 		const bool settling = object != nullptr && object == g_restored.obj && g_restored.alive() &&
 			(g_restorePending || GetTickCount64() - g_restoredAt <= kRestoreSettleMs);
 		if ((g_standInObj == nullptr && g_mobBodyOf.empty() && !settling) || parms == nullptr)

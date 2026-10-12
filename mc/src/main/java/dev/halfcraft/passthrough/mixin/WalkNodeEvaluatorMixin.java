@@ -1,11 +1,13 @@
 package dev.halfcraft.passthrough.mixin;
 
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import dev.halfcraft.passthrough.HostGround;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.BlockGetter;
-import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.pathfinder.PathfindingContext;
 import net.minecraft.world.level.pathfinder.PathType;
 import net.minecraft.world.level.pathfinder.WalkNodeEvaluator;
 import org.spongepowered.asm.mixin.Mixin;
@@ -21,34 +23,36 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  */
 @Mixin(WalkNodeEvaluator.class)
 abstract class WalkNodeEvaluatorMixin {
+	/**
+	 * Where a path starts, for a mob off the ground (a step, a hop on a slope): vanilla goes down from it through air
+	 * to the first block. The host's ground is air to vanilla: that went down into the void, no path was found and the
+	 * mob wandered off. Its solid cells are a block to that search.
+	 */
+	@WrapOperation(method = "getStart()Lnet/minecraft/world/level/pathfinder/Node;", at = @At(value = "INVOKE",
+		target = "Lnet/minecraft/world/level/pathfinder/PathfindingContext;getBlockState(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;"))
+	private BlockState passthrough$hostGroundUnderMob(final PathfindingContext context, final BlockPos pos, final Operation<BlockState> original) {
+		BlockState state = original.call(context, pos);
+		return HostGround.solidAir(context.level(), pos, state) ? Blocks.STONE.defaultBlockState() : state;
+	}
+
 	@Inject(method = "getPathTypeFromState(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/pathfinder/PathType;",
 		at = @At("HEAD"), cancellable = true)
 	private static void passthrough$hostGroundType(final BlockGetter level, final BlockPos pos, final CallbackInfoReturnable<PathType> cir) {
 		HostGround.Cell cell = HostGround.cellAt(pos);
-		BlockState state = level.getBlockState(pos);
-		boolean barrier = state.is(Blocks.BARRIER) && !(level instanceof Level l && l.dimension() != Level.OVERWORLD);
-		if (cell == null) {
-			// a barrier in the open (the player's, for support) isn't in anyone's way: it doesn't collide
-			if (barrier) {
-				cir.setReturnValue(PathType.OPEN);
-			}
-
+		if (cell == null || !HostGround.inHost(level)) {
 			return;
 		}
 
-		// a real block in the cell: vanilla's. Our barriers can't be left to vanilla: it reads "is this a full block"
-		// from a per-block-type cache built at startup, when a barrier's shape (BlockStateSuffocationMixin: the
-		// host cell's, none without one) was empty - every barrier was OPEN, the whole floor was air to mobs and
-		// those standing on it found no path at all
-		if (!state.isAir() && !barrier) {
+		// a real block in the cell: vanilla's. The cell itself is air to vanilla (no block there): its type is ours
+		if (!level.getBlockState(pos).isAir()) {
 			return;
 		}
 
 		if (cell.whole()) {
 			cir.setReturnValue(PathType.BLOCKED);
-		} else if (barrier) {
-			// a slope's support barrier: walked in, its floor where the slope is (getFloorLevel below). As a solid step
-			// (BLOCKED, the node on top) a low slope's next node stood more than a step above the mob: it jumped
+		} else if (cell.support()) {
+			// the ground's surface on a slope: walked in, its floor where the slope is (getFloorLevel below). As a solid
+			// step (BLOCKED, the node on top) a low slope's next node stood more than a step above the mob: it jumped
 			cir.setReturnValue(PathType.OPEN);
 		} else {
 			cir.setReturnValue(switch (cell.kind()) {
@@ -68,13 +72,13 @@ abstract class WalkNodeEvaluatorMixin {
 			floor = Math.max(floor, pos.getY() + own.top());
 		}
 
-		// the cell below: its top (a fence's counts 1.5 high, out of a mob's step and jump); with one of our barriers in
-		// it, its own top rather than the barrier's
+		// the cell below: its top (a fence's counts 1.5 high, out of a mob's step and jump); the ground's surface on a
+		// slope is walked in, so its own top rather than a block's
 		BlockPos below = pos.below();
 		HostGround.Cell under = HostGround.cellAt(below);
 		if (under != null && !under.whole()) {
 			double top = below.getY() + (under.kind() == HostGround.Kind.FENCE ? 1.5 : under.top());
-			floor = HostGround.exactInstead(level.getBlockState(below), under) ? Math.max(top, own != null && own.kind() == HostGround.Kind.LOW
+			floor = under.support() && level.getBlockState(below).isAir() ? Math.max(top, own != null && own.kind() == HostGround.Kind.LOW
 				? pos.getY() + own.top() : top) : Math.max(floor, top);
 		}
 

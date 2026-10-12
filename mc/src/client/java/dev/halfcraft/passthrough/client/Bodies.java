@@ -7,7 +7,6 @@ import java.util.Map;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
@@ -25,7 +24,7 @@ public final class Bodies {
 	private static final double[] RADIUS = MobWar.BODY_RADIUS;
 	private static final double HEAD_RADIUS = MobWar.HEAD_RADIUS;
 	private static final int POINTS = MobWar.BODY_POINTS;
-	/** How far into the barrier ground a lying body may be and still be hit (the ground is in whole blocks). */
+	/** How far into the host's ground a lying body may be and still be hit. */
 	private static final double THROUGH_GROUND = 0.6;
 
 	/** handle -> points (x, y, z each). Replaced whole by the WebSocket thread. */
@@ -65,13 +64,15 @@ public final class Bodies {
 
 		Vec3 eye = player.getEyePosition(partialTick);
 		Vec3 dir = player.getViewVector(partialTick);
-		double reach = player.entityInteractionRange();
+		// the weapon's reach (a spear's is longer, and has a minimum)
+		net.minecraft.world.item.component.AttackRange range = player.getAttackRangeWith(player.getMainHandItem());
+		double reach = range.effectiveMaxRange(player), min = range.effectiveMinRange(player);
 		// what Minecraft found, and how far: a body counts if it's nearer (a lying one a little into the ground, too)
 		HitResult found = minecraft.hitResult;
 		double limit = reach;
 		if (found != null && found.getType() != HitResult.Type.MISS) {
 			limit = Math.min(limit, found.getLocation().distanceTo(eye));
-			if (found instanceof BlockHitResult block && minecraft.level.getBlockState(block.getBlockPos()).is(Blocks.BARRIER)) {
+			if (found instanceof BlockHitResult block && dev.halfcraft.passthrough.HostGround.cellAt(block.getBlockPos()) != null) {
 				limit = Math.min(reach, limit + THROUGH_GROUND);
 			}
 		}
@@ -91,7 +92,7 @@ public final class Bodies {
 					t = rayCapsule(eye, dir, p[a], p[a + 1], p[a + 2], p[b], p[b + 1], p[b + 2], RADIUS[s]);
 				}
 
-				if (t >= 0.0 && t < bestT) {
+				if (t >= min && t < bestT) {
 					bestT = t;
 					bestHandle = e.getKey();
 				}

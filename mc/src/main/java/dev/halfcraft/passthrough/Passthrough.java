@@ -35,7 +35,6 @@ public class Passthrough implements ModInitializer {
 			// before the world is saved: the Nether goes back and the fight's mobs go, so none of it is kept
 			Nether.detach(server);
 			MobWar.detach(server);
-			WorldBridge.writeRecord(server);
 			WorldBridge.detach();
 		});
 		ServerEntityEvents.ENTITY_LOAD.register(MobWar::onEntityLoad);

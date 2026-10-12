@@ -18,9 +18,11 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Clicking one of the host's partial ground cells (HostGround: air to Minecraft, so a block would go into it): the
- * block goes next to the face clicked, as on a real block - except on top of a floor in the lower half of its cell,
- * where it stays in that cell (on the floor, sunk at most half a block, rather than floating over it).
+ * Clicking one of the host's ground cells (HostGround: air to Minecraft, so a block would go into it): the block goes
+ * where it sits closest to the surface clicked. That surface can be anywhere in its cell (a floor low in it, a wall at
+ * its back): with more than half the cell free in front of it, the block goes into that cell (sunk into the surface at
+ * most half a block), else next to the face clicked, as on a real block (at most half a block off it). A torch on a
+ * wall at the back of its cell hung a whole block out in the air before.
  */
 @Mixin(BlockPlaceContext.class)
 abstract class BlockPlaceContextMixin {
@@ -45,8 +47,11 @@ abstract class BlockPlaceContextMixin {
 			return;
 		}
 
-		boolean lowFloor = hit.getDirection() == Direction.UP && host.max(Direction.Axis.Y) <= 0.5;
-		if (!lowFloor) {
+		// how much of the cell is free in front of the surface clicked, along its face
+		Direction face = hit.getDirection();
+		double at = Math.clamp(hit.getLocation().get(face.getAxis()) - clicked.get(face.getAxis()), 0.0, 1.0);
+		double free = face.getAxisDirection() == Direction.AxisDirection.POSITIVE ? 1.0 - at : at;
+		if (free < 0.5) {
 			this.replaceClicked = false; // (getClickedPos is then relativePos: the cell next to the face)
 		}
 	}
