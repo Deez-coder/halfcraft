@@ -28,6 +28,11 @@ abstract class ServerPlayerMixin {
 		}
 	}
 
+	@Inject(method = "restoreFrom(Lnet/minecraft/server/level/ServerPlayer;Z)V", at = @At("RETURN"))
+	private void passthrough$keepKitTag(final ServerPlayer old, final boolean alive, final CallbackInfo ci) {
+		dev.halfcraft.passthrough.Kit.respawned(old, (ServerPlayer) (Object) this);
+	}
+
 	@Inject(method = "onExplosionHit(Lnet/minecraft/world/entity/Entity;)V", at = @At("HEAD"))
 	private void passthrough$beforeBurst(final Entity cause, final CallbackInfo ci) {
 		ServerPlayer self = (ServerPlayer) (Object) this;

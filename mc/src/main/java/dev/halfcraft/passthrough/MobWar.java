@@ -173,8 +173,29 @@ public final class MobWar {
 		}
 	}
 
+	/**
+	 * Lightning (a storm, a channeling trident) on a proxy (server thread, Villager.thunderHit, in its place): the
+	 * real fighter is struck ({"t":"lightning","h":fighter}) and catches fire, as anyone does in Minecraft. The bolt
+	 * strikes every tick it flashes; the fighter once.
+	 */
+	public static void onProxyLightning(final LivingEntity proxy) {
+		Integer handle = handleOf.get(proxy.getId());
+		long now = proxy.level().getGameTime();
+		if (handle == null || isDeadProxy(proxy) || now - lastBolt.getOrDefault(handle, -100L) < 20L) {
+			return;
+		}
+
+		lastBolt.put(handle, now);
+		proxy.igniteForSeconds(8.0F);
+		if (Passthrough.own) {
+			Passthrough.events.accept(String.format(Locale.ROOT, "{\"t\":\"lightning\",\"h\":%d}", handle));
+		}
+	}
+
 	/** Mobs' hits on proxies, waiting for the proxy's next tick to go with the knockback they gave it (server thread). */
 	private static final Map<Integer, String> pendingHits = new HashMap<>();
+	/** The game time lightning last struck each fighter (by handle). */
+	private static final Map<Integer, Long> lastBolt = new HashMap<>();
 
 	/**
 	 * A proxy was hurt (server thread, from LivingEntity.hurtServer; the damage itself is always cancelled). True when

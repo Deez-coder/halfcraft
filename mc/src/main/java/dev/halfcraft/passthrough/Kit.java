@@ -148,11 +148,21 @@ public final class Kit {
 		player.inventoryMenu.broadcastChanges();
 	}
 
-	/** Minecraft starts driving: a player who never had the kit gets it. */
+	/** Minecraft starts driving: a player who never had the kit gets it (unless /hs kit auto is off). */
 	public static void giveFirst() {
 		MinecraftServer s = WorldBridge.server();
-		if (s != null) {
+		if (s != null && auto) {
 			s.execute(() -> s.getPlayerList().getPlayers().stream().filter(p -> !p.entityTags().contains(GIVEN_TAG)).forEach(p -> give(s, p)));
+		}
+	}
+
+	/**
+	 * Respawn: Minecraft makes a new player and drops his tags, so after a death (every lost fight) the next start
+	 * took him for new and replaced what he carried with the kit. The new player keeps having had it.
+	 */
+	public static void respawned(final ServerPlayer old, final ServerPlayer player) {
+		if (old.entityTags().contains(GIVEN_TAG)) {
+			player.addTag(GIVEN_TAG);
 		}
 	}
 

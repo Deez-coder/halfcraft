@@ -90,6 +90,8 @@ namespace
 		bool balance = true; // cap Half Sword a little above Minecraft's rate (Minecraft does the same the other way)
 		double props = 1.0;  // how hard Steve's blows push loose things (/hs props)
 		double current = 1.0; // how hard water's and lava's currents push the fighters (/hs current)
+		double explosions = 1.0; // how hard explosions throw them (/hs explosions)
+		double mace = 1.0;   // the mace's damage (/hs mace)
 	} g_cfg;
 	int g_fpsApplied = 0;
 	// Minecraft's frame rate, from the export's publish counter (for the balance)
@@ -223,9 +225,9 @@ namespace
 	constexpr double kRodPull = 1.6;    // a fishing rod's yank: x Minecraft's pull
 	constexpr double kWindPush = 1.0;      // wind charges, Wind Burst, a mace's shockwave: Minecraft's push as it is
 	constexpr double kMaxPush = 1600.0;    // cm/s: past this a ragdoll just comes apart
-	constexpr double kChargeShove = 70.0;     // cm/s of whole-body shove per m/s of a spear charge
-	constexpr double kMaxChargeShove = 1100.0;
-	constexpr double kChargeFloors = 7.0;     // m/s: a charge this fast (a horse's) takes him off his feet
+	constexpr double kChargeShove = 120.0;    // cm/s of whole-body shove per m/s of a spear charge
+	constexpr double kMaxChargeShove = 1800.0;
+	constexpr double kChargeFloors = 5.0;     // m/s: a charge this fast (a sprint's) takes him off his feet
 	constexpr double kPlayerKnockbackPerLevel = 180.0; // cm/s of whole-body shove per level of Knockback / Punch
 	struct MobBody
 	{
@@ -1398,6 +1400,7 @@ namespace
 		const bool thrown = kind == "snowball" || kind == "egg"; // only a push (below), no blow
 		// Minecraft's damage sets how hard: ~400 cm/s for a fist, ~1500 for a diamond sword, more for crits
 		double speed = std::clamp(350.0 + 160.0 * points, 350.0, 2400.0) * (crit ? 1.3 : 1.0);
+		const bool mace = item == "mace";
 		// a mace smash: Minecraft's bonus for the fall (12 for 3 blocks, 22 for 8, +1 a block after that) as the speed
 		// of the blow, past the usual cap: from high enough it's a killing blow, as in Minecraft
 		const double smash = json_num(m, "smash", 0.0);
@@ -1406,7 +1409,7 @@ namespace
 		// a spear's charge: how fast Steve came on (m/s: ~5.6 sprinting, ~14 on a horse) past the cap too
 		const double charge = json_num(m, "charge", 0.0);
 		if (charge > 0.0)
-			speed = std::clamp(1500.0 + 300.0 * charge, 1500.0, 6000.0);
+			speed = std::clamp(2400.0 + 450.0 * charge, 2400.0, 8000.0);
 		const bool spear = item.size() > 6 && item.compare(item.size() - 6, 6, "_spear") == 0;
 		if (thrown)
 		{
@@ -1423,7 +1426,19 @@ namespace
 			if (by == nullptr && g_standIn.ref.alive())
 				by = as_willie(g_standIn.ref.obj)->Mesh;
 			if (spear)
-				strike_fighter(w, bone, at, dir, speed, 15.0, 0.6, 0.4, 0, crit, by != nullptr ? by : w->Mesh, nullptr, item.c_str());
+				strike_fighter(w, bone, at, dir, speed, 15.0, 0.6, 0.4, 0, crit || charge > 0.0, by != nullptr ? by : w->Mesh, nullptr, item.c_str());
+			else if (mace)
+			{
+				// (/hs mace: on what the blow took)
+				const double before = w->Health;
+				strike_fighter(w, bone, at, dir, speed, 0.0, 0.0, 1.1, 0, crit, by != nullptr ? by : w->Mesh, nullptr, item.c_str());
+				if (g_cfg.mace != 1.0 && w->Health < before && w->Health > 0.0)
+				{
+					w->Health = before - (before - w->Health) * g_cfg.mace;
+					if (w->Health <= 0.0)
+						w->Death();
+				}
+			}
 			else
 				strike_fighter(w, bone, at, dir, speed, 0.0, 0.0, 1.1, 0, crit, by != nullptr ? by : w->Mesh, nullptr, item.empty() ? "fist" : item.c_str());
 		}
@@ -1929,7 +1944,10 @@ namespace
 	}
 
 
-	/// A Minecraft explosion: a blunt blast through Half Sword's hit pipeline for every fighter in reach, and a shove.
+	constexpr double kLightningHealth = 30.0; // a bolt's damage off his health
+
+	/// A Minecraft explosion: a blunt blast through Half Sword's hit pipeline for every fighter in reach, and a shove
+	/// (/hs explosions: how hard).
 	void on_explosion(const std::string &m)
 	{
 		double c[3];
@@ -1960,13 +1978,35 @@ namespace
 					nullptr, "explosion");
 			}
 			// and it throws him: off his feet, up and away, every part of him
-			const double push = 1500.0 * impact;
+			const double push = 1500.0 * impact * g_cfg.explosions;
 			const double len = std::max(1e-3, std::sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z));
-			w->Mesh->AddImpulseToAllBodiesBelow(SDK::FVector(d.X / len * push, d.Y / len * push, d.Z / len * push + 800.0 * impact), name(L"pelvis"), true,
+			w->Mesh->AddImpulseToAllBodiesBelow(SDK::FVector(d.X / len * push, d.Y / len * push, d.Z / len * push + 800.0 * impact * g_cfg.explosions), name(L"pelvis"), true,
 				true);
 			w->Force_Fall = true;
 			g_fallUntil[ref.index] = GetTickCount64() + 1500;
 		}
+	}
+
+	/// {"t":"lightning","h":fighter}: a bolt strikes him (Minecraft sets him on fire too: the fire's panic follows). It
+	/// goes through him from the head down, takes a good part of his health, his legs and nearly his senses.
+	void on_lightning(const std::string &m)
+	{
+		const int handle = int(json_num(m, "h", -1));
+		auto *w = fighter_by_handle(handle);
+		if (w == nullptr || w->Mesh == nullptr || w->DED || w->Health <= 0.0)
+			return;
+		SDK::UPrimitiveComponent *by = g_standIn.ref.alive() ? as_willie(g_standIn.ref.obj)->Mesh : w->Mesh;
+		const SDK::FName head = name(L"Head");
+		strike_fighter(w, head, w->Mesh->GetSocketLocation(head), SDK::FVector(0, 0, -1), 2600.0, 0.0, 0.0, 1.0, 2, true, by, nullptr, "lightning");
+		const double before = w->Health;
+		w->Health -= kLightningHealth * g_cfg.dealt;
+		w->Stamina = 0.0;
+		w->Consciousness = std::max(0.0, w->Consciousness - 60.0);
+		w->Force_Fall = true;
+		g_fallUntil[handle] = GetTickCount64() + 2500;
+		hslog::info("lightning on fighter %d: health %.1f -> %.1f", handle, before, w->Health);
+		if (w->Health <= 0.0)
+			w->Death();
 	}
 
 	void on_config(const std::string &m)
@@ -1980,6 +2020,8 @@ namespace
 		g_cfg.balance = json_num(m, "balance", 1.0) != 0.0;
 		g_cfg.props = json_num(m, "props", 1.0);
 		g_cfg.current = json_num(m, "current", 1.0);
+		g_cfg.explosions = json_num(m, "explosions", 1.0);
+		g_cfg.mace = json_num(m, "mace", 1.0);
 		hslog::info("damage settings: dealt x%.2f taken x%.2f potions x%.2f head %.2f neck %.2f torso %.2f arms %.2f legs %.2f", g_cfg.dealt, g_cfg.taken, g_cfg.potions,
 			g_cfg.part[kHead], g_cfg.part[kNeck], g_cfg.part[kTorso], g_cfg.part[kArms], g_cfg.part[kLegs]);
 	}
@@ -3533,6 +3575,8 @@ namespace
 			on_config(m);
 		else if (t == "burn")
 			on_burn(m);
+		else if (t == "lightning")
+			on_lightning(m);
 		else if (t == "magic")
 			on_magic(m);
 		else if (t == "heal")

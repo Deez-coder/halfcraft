@@ -8,6 +8,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
+#include <d3d12.h>
 #include <reshade.hpp>
 #include "log.h"
 
@@ -60,6 +61,7 @@ namespace
 	{
 		ULONGLONG since = 0;
 		int presents = 0, uploads = 0, exact = 0, withHost = 0, missed = 0, sameFrame = 0, torn = 0, staged = 0, waited = 0, direct = 0;
+		int zeroCopy = 0, gpuLate = 0; // frames copied from the shared textures; frames there but not ready (or not ours)
 		double uploadMs = 0, uploadMaxMs = 0;
 		double ageMs = 0, publishMs = 0; // the shown frame: capture (Minecraft) to compose (here), and capture to publish
 		double tickMs = 0;               // the bridge's tick (camera set) to the compose of that frame
@@ -111,6 +113,178 @@ namespace
 		T v;
 		std::memcpy(&v, p, sizeof(T));
 		return v;
+	}
+
+	// ---- zero copy (GpuShare.java): textures shared by name with Minecraft, which draws its layers straight into
+	// them (GPU to GPU) instead of ~25 MB a frame through the mapping and the upload buffers ----
+	constexpr const wchar_t *kGpuMappingName = L"Local\\MCPassthroughGpu";
+	constexpr uint32_t kGpuMagic = 0x5047434D; // "MCGP"
+	constexpr int kGpuSlots = 6;               // Minecraft's slots: a frame's textures are its slot's
+	constexpr int32_t kFlagGpu = 8;            // (slot flags) the frame is in the slot's shared textures, not in the mapping
+
+	struct GpuShare
+	{
+		uint8_t *view = nullptr; // "Local\MCPassthroughGpu": what Minecraft opens (layout in GpuShare.java)
+		ID3D12Fence *fence = nullptr;
+		HANDLE fenceHandle = nullptr;
+		ID3D12Resource *tex[kGpuSlots][3] = {};
+		HANDLE handles[kGpuSlots][3] = {}; // (a name lives as long as a handle to it)
+		uint32_t w = 0, h = 0;
+		int32_t gen = 0;
+		bool taken = false; // Minecraft said it opened them
+		bool off = false;   // they couldn't be made, or Minecraft couldn't open them: the old way only
+	} g_gpu;
+
+	template <typename T>
+	void write(uint8_t *p, T v)
+	{
+		std::memcpy(p, &v, sizeof(T));
+	}
+
+	uint8_t *gpu_view()
+	{
+		if (g_gpu.view == nullptr)
+			if (HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 4096, kGpuMappingName))
+				g_gpu.view = static_cast<uint8_t *>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 4096));
+		return g_gpu.view;
+	}
+
+	/// (only once the GPU is done with them: a wait for idle, or never used)
+	void destroy_gpu()
+	{
+		if (g_gpu.view != nullptr)
+			write<int32_t>(g_gpu.view + 28, 0);
+		for (int s = 0; s < kGpuSlots; ++s)
+			for (int l = 0; l < 3; ++l)
+			{
+				if (g_gpu.tex[s][l] != nullptr)
+					g_gpu.tex[s][l]->Release();
+				if (g_gpu.handles[s][l] != nullptr)
+					CloseHandle(g_gpu.handles[s][l]);
+				g_gpu.tex[s][l] = nullptr;
+				g_gpu.handles[s][l] = nullptr;
+			}
+		if (g_gpu.fence != nullptr)
+			g_gpu.fence->Release();
+		if (g_gpu.fenceHandle != nullptr)
+			CloseHandle(g_gpu.fenceHandle);
+		g_gpu.fence = nullptr;
+		g_gpu.fenceHandle = nullptr;
+		g_gpu.w = g_gpu.h = 0;
+		g_gpu.taken = false;
+	}
+
+	/// Shared textures for Minecraft's w x h frames (each slot: world, depth R32F, overlay) and the fence it signals,
+	/// under a new generation of names.
+	void ensure_gpu(device *dev, uint32_t w, uint32_t h)
+	{
+		uint8_t *v = gpu_view();
+		if (g_gpu.off || v == nullptr || (g_gpu.w == w && g_gpu.h == h))
+			return;
+		destroy_gpu();
+		if (dev->get_api() != device_api::d3d12)
+		{
+			g_gpu.off = true;
+			return;
+		}
+		auto *d3d = reinterpret_cast<ID3D12Device *>(dev->get_native());
+		const int32_t gen = std::max(read<int32_t>(v + 8), g_gpu.gen) + 1;
+		const DWORD pid = GetCurrentProcessId();
+		wchar_t name[96];
+		swprintf_s(name, L"Local\\MCPT_%lu_%d_f", pid, gen);
+		bool ok = SUCCEEDED(d3d->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_gpu.fence))) &&
+			SUCCEEDED(d3d->CreateSharedHandle(g_gpu.fence, nullptr, GENERIC_ALL, name, &g_gpu.fenceHandle));
+		const DXGI_FORMAT formats[3] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM};
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+		uint64_t sizes[3] = {};
+		for (int l = 0; l < 3 && ok; ++l)
+		{
+			D3D12_RESOURCE_DESC rd = {};
+			rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			rd.Width = w;
+			rd.Height = h;
+			rd.DepthOrArraySize = 1;
+			rd.MipLevels = 1;
+			rd.Format = formats[l];
+			rd.SampleDesc.Count = 1;
+			rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			sizes[l] = d3d->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+			for (int s = 0; s < kGpuSlots && ok; ++s)
+			{
+				swprintf_s(name, L"Local\\MCPT_%lu_%d_%d_%d", pid, gen, s, l);
+				ok = SUCCEEDED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+						 IID_PPV_ARGS(&g_gpu.tex[s][l]))) &&
+					SUCCEEDED(d3d->CreateSharedHandle(g_gpu.tex[s][l], nullptr, GENERIC_ALL, name, &g_gpu.handles[s][l]));
+			}
+		}
+		if (!ok)
+		{
+			hslog::info("compositor: couldn't make the shared textures: Minecraft's frames come the old way");
+			destroy_gpu();
+			g_gpu.off = true;
+			return;
+		}
+		g_gpu.w = w;
+		g_gpu.h = h;
+		g_gpu.gen = gen;
+		write<uint32_t>(v, kGpuMagic);
+		write<int32_t>(v + 4, 1);
+		write<int32_t>(v + 8, gen);
+		write<int32_t>(v + 12, int32_t(w));
+		write<int32_t>(v + 16, int32_t(h));
+		write<int32_t>(v + 20, kGpuSlots);
+		write<int32_t>(v + 24, int32_t(pid));
+		for (int l = 0; l < 3; ++l)
+			write<int64_t>(v + 32 + 8 * l, int64_t(sizes[l]));
+		MemoryBarrier();
+		write<int32_t>(v + 28, 1);
+		hslog::info("compositor: shared textures for Minecraft's %ux%u frames (generation %d)", w, h, gen);
+	}
+
+	/// What Minecraft made of the textures: taken (logged once), or not (back to the old way for good).
+	void check_gpu()
+	{
+		if (g_gpu.gen == 0 || g_gpu.off || g_gpu.view == nullptr)
+			return;
+		if (!g_gpu.taken && read<int32_t>(g_gpu.view + 64) == g_gpu.gen)
+		{
+			g_gpu.taken = true;
+			hslog::info("compositor: Minecraft draws straight into the shared textures (zero copy)");
+		}
+		if (read<int32_t>(g_gpu.view + 68) == g_gpu.gen)
+		{
+			hslog::info("compositor: Minecraft couldn't open the shared textures: its frames come the old way");
+			destroy_gpu(); // (never used: Minecraft wrote nothing into them)
+			g_gpu.off = true;
+		}
+	}
+
+	/// Record the copy of the slot's shared textures into the effect's: the frame Minecraft drew there. False if it
+	/// isn't there (an older generation, the fence not passed yet).
+	bool copy_shared(command_list *cmd, int32_t slot, const uint8_t *desc, const resource (&textures)[3])
+	{
+		const int64_t value = read<int64_t>(desc + 104);
+		if (read<int32_t>(desc + 112) != g_gpu.gen || slot >= kGpuSlots || g_gpu.tex[slot][0] == nullptr ||
+			(value != 0 && g_gpu.fence->GetCompletedValue() < uint64_t(value)))
+			return false;
+		auto *list = reinterpret_cast<ID3D12GraphicsCommandList *>(cmd->get_native());
+		D3D12_RESOURCE_BARRIER b[3] = {};
+		for (int l = 0; l < 3; ++l)
+		{
+			b[l].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			b[l].Transition.pResource = g_gpu.tex[slot][l];
+			b[l].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			b[l].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+			b[l].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		}
+		list->ResourceBarrier(3, b);
+		for (int l = 0; l < 3; ++l)
+			list->CopyResource(reinterpret_cast<ID3D12Resource *>(textures[l].handle), g_gpu.tex[slot][l]);
+		for (D3D12_RESOURCE_BARRIER &x : b)
+			std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+		list->ResourceBarrier(3, b);
+		return true;
 	}
 
 	bool open_mapping()
@@ -192,6 +366,7 @@ namespace
 	void destroy_layers(device *dev)
 	{
 		destroy_staging(dev);
+		destroy_gpu();
 		for (Layer *layer : {&g_world, &g_depth, &g_overlay})
 		{
 			if (layer->srv.handle != 0)
@@ -293,6 +468,8 @@ namespace
 			const int32_t slot = read<int32_t>(view + 40);
 			if (slot < 0 || slot >= g_slots)
 				continue;
+			if (read<int32_t>(view + kSlotDesc + kSlotDescBytes * slot + 44) & kFlagGpu)
+				continue; // (in the shared textures: nothing to stage)
 			const int64_t frame = read<int64_t>(view + kSlotDesc + kSlotDescBytes * slot + 8);
 			std::shared_lock<std::shared_mutex> life(g_stagesLife);
 			if (g_stageW == 0)
@@ -417,52 +594,84 @@ namespace
 			destroy_layers(dev);
 			if (!create_layer(dev, g_world, w, h, format::r8g8b8a8_unorm) ||
 				!create_layer(dev, g_depth, w, h, format::r32_float) ||
-				!create_layer(dev, g_overlay, w, h, format::r8g8b8a8_unorm) ||
-				!ensure_staging(dev, w, h))
+				!create_layer(dev, g_overlay, w, h, format::r8g8b8a8_unorm))
 			{
 				destroy_layers(dev);
 				return;
 			}
+			ensure_gpu(dev, w, h);
 			g_width = w;
 			g_height = h;
 			bind(runtime);
 		}
-		// the frame, staged by the worker (normally done long before: Minecraft published it before the camera copied it)
-		int stage = find_stage(mcFrame);
-		if (stage >= 0)
-			++g_stats.staged;
-		else if (g_workerFrame.load() == mcFrame)
+		const resource textures[3] = {g_world.tex, g_depth.tex, g_overlay.tex};
+		const resource_usage readable[3] = {resource_usage::shader_resource, resource_usage::shader_resource, resource_usage::shader_resource};
+		const resource_usage writable[3] = {resource_usage::copy_dest, resource_usage::copy_dest, resource_usage::copy_dest};
+		uint8_t shared[kSlotDescBytes];
+		const uint8_t *sd = nullptr;
+		if (read<int32_t>(desc + 44) & kFlagGpu)
 		{
-			const ULONGLONG until = GetTickCount64() + 12;
-			while (stage < 0 && g_workerFrame.load() == mcFrame && GetTickCount64() < until)
-			{
-				YieldProcessor();
-				stage = find_stage(mcFrame);
-			}
-			stage = find_stage(mcFrame);
-			if (stage >= 0)
-				++g_stats.waited;
-		}
-		if (stage < 0)
-		{
-			// not staged (just resized, or no event from Minecraft): stage it here
-			std::shared_lock<std::shared_mutex> life(g_stagesLife);
-			stage = take_stage();
-			if (stage < 0)
+			// zero copy: the frame is in the slot's shared textures, a copy on the GPU away
+			std::memcpy(shared, desc, kSlotDescBytes);
+			if (read<int64_t>(shared) != seq)
 				return;
-			if (!fill_stage(stage, g_view, slot))
+			cmd->barrier(3, textures, readable, writable);
+			const bool ok = copy_shared(cmd, slot, shared, textures);
+			cmd->barrier(3, textures, writable, readable);
+			if (!ok)
 			{
-				++g_stats.torn;
-				return; // Minecraft rewrote the slot mid-copy: show the next one instead
+				++g_stats.gpuLate;
+				return;
 			}
-			++g_stats.direct;
+			++g_stats.zeroCopy;
+			sd = shared;
 		}
+		else
 		{
-			std::lock_guard<std::mutex> lock(g_stageLock);
-			g_stages[stage].usedAt = g_presents.load();
+			// (the upload buffers, ~200 MB, only once a frame comes this way: with zero copy, none does)
+			if (!ensure_staging(dev, w, h))
+				return;
+			// the frame, staged by the worker (normally done long before: Minecraft published it before the camera copied it)
+			int stage = find_stage(mcFrame);
+			if (stage >= 0)
+				++g_stats.staged;
+			else if (g_workerFrame.load() == mcFrame)
+			{
+				const ULONGLONG until = GetTickCount64() + 12;
+				while (stage < 0 && g_workerFrame.load() == mcFrame && GetTickCount64() < until)
+				{
+					YieldProcessor();
+					stage = find_stage(mcFrame);
+				}
+				stage = find_stage(mcFrame);
+				if (stage >= 0)
+					++g_stats.waited;
+			}
+			if (stage < 0)
+			{
+				// not staged (just resized, or no event from Minecraft): stage it here
+				std::shared_lock<std::shared_mutex> life(g_stagesLife);
+				stage = take_stage();
+				if (stage < 0)
+					return;
+				if (!fill_stage(stage, g_view, slot))
+				{
+					++g_stats.torn;
+					return; // Minecraft rewrote the slot mid-copy: show the next one instead
+				}
+				++g_stats.direct;
+			}
+			{
+				std::lock_guard<std::mutex> lock(g_stageLock);
+				g_stages[stage].usedAt = g_presents.load();
+			}
+			const Stage &staged = g_stages[stage];
+			sd = staged.desc;
+			cmd->barrier(3, textures, readable, writable);
+			for (int l = 0; l < 3; ++l)
+				cmd->copy_buffer_to_texture(staged.buf, l * g_stagingLayer, g_stagingPitch / 4, h, textures[l], 0);
+			cmd->barrier(3, textures, writable, readable);
 		}
-		const Stage &staged = g_stages[stage];
-		const uint8_t *sd = staged.desc;
 		QueryPerformanceCounter(&t1);
 		const double ms = double(t1.QuadPart - t0.QuadPart) * 1000.0 / g_qpcFreq.QuadPart;
 		g_stats.uploadMs += ms;
@@ -471,13 +680,6 @@ namespace
 		const double nowNs = double(t1.QuadPart) / double(g_qpcFreq.QuadPart) * 1.0e9;
 		g_stats.ageMs += (nowNs - double(read<int64_t>(sd + 88))) / 1.0e6;
 		g_stats.publishMs += double(read<int64_t>(sd + 96) - read<int64_t>(sd + 88)) / 1.0e6;
-		const resource textures[3] = {g_world.tex, g_depth.tex, g_overlay.tex};
-		const resource_usage readable[3] = {resource_usage::shader_resource, resource_usage::shader_resource, resource_usage::shader_resource};
-		const resource_usage writable[3] = {resource_usage::copy_dest, resource_usage::copy_dest, resource_usage::copy_dest};
-		cmd->barrier(3, textures, readable, writable);
-		for (int l = 0; l < 3; ++l)
-			cmd->copy_buffer_to_texture(staged.buf, l * g_stagingLayer, g_stagingPitch / 4, h, textures[l], 0);
-		cmd->barrier(3, textures, writable, readable);
 		g_lastPublish = published;
 		g_shownFrame = read<int64_t>(sd + 8);
 		++g_stats.uploads;
@@ -583,6 +785,7 @@ namespace
 		}
 		if (on)
 		{
+			check_gpu();
 			upload(runtime, cmd, host);
 			Stats &s = g_stats;
 			if (host.valid && host.qpc != 0)
@@ -611,11 +814,12 @@ namespace
 				const int64_t pub = read<int64_t>(g_view + 32);
 				const float secs = (now - s.since) / 1000.0f;
 				hslog::info("compositor: host %.0f fps, Minecraft %.0f fps, uploads %d (%.2f ms avg, %.2f max; staged %d, waited %d, here %d), "
-					"shown frame age %.1f ms (publish %.1f, tick to compose %.1f), same frame again %d, torn %d, pose error avg %.2f max %.2f, exact %d/%d, copied frame gone %d",
+					"shown frame age %.1f ms (publish %.1f, tick to compose %.1f), same frame again %d, torn %d, pose error avg %.2f max %.2f, exact %d/%d, copied frame gone %d, "
+					"zero copy %d (not ready %d)",
 					s.presents / secs, (pub - s.publishedAt) / secs, s.uploads, s.uploads ? s.uploadMs / s.uploads : 0.0, s.uploadMaxMs, s.staged, s.waited,
 					s.direct, s.uploads ? s.ageMs / s.uploads : 0.0, s.uploads ? s.publishMs / s.uploads : 0.0,
 					s.withHost ? s.tickMs / s.withHost : 0.0, s.sameFrame, s.torn,
-					s.withHost ? s.errSum / s.withHost : 0.0f, s.errMax, s.exact, s.withHost, s.missed);
+					s.withHost ? s.errSum / s.withHost : 0.0f, s.errMax, s.exact, s.withHost, s.missed, s.zeroCopy, s.gpuLate);
 				s = Stats{};
 				s.since = now;
 				s.publishedAt = pub;

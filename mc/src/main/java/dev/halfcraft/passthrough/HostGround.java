@@ -98,6 +98,23 @@ public final class HostGround {
 	private HostGround() {
 	}
 
+	/**
+	 * Clicking one of the host's ground cells (air to Minecraft): whether what's put there goes into that cell, more
+	 * than half of it free in front of the surface clicked (a floor low in it, a wall at its back), rather than next
+	 * to the face clicked, as on a real block. A torch on a wall at the back of its cell hung a whole block out in the
+	 * air before, fire on a bump floated over it.
+	 */
+	public static boolean intoCell(final net.minecraft.world.level.Level level, final BlockPos clicked, final net.minecraft.core.Direction face,
+		final net.minecraft.world.phys.Vec3 hit) {
+		if (level == null || level.dimension() != net.minecraft.world.level.Level.OVERWORLD || shapeAt(clicked) == null || !level.getBlockState(clicked).isAir()) {
+			return false;
+		}
+
+		double at = Math.clamp(hit.get(face.getAxis()) - clicked.get(face.getAxis()), 0.0, 1.0);
+		double free = face.getAxisDirection() == net.minecraft.core.Direction.AxisDirection.POSITIVE ? 1.0 - at : at;
+		return free >= 0.5;
+	}
+
 	/** The host's shape in this cell, or null. */
 	public static VoxelShape shapeAt(final BlockPos pos) {
 		Cell c = cellAt(pos);

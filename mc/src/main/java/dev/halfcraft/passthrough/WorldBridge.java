@@ -51,7 +51,7 @@ public final class WorldBridge {
 		return server != null;
 	}
 
-	static MinecraftServer server() {
+	public static MinecraftServer server() {
 		return server;
 	}
 

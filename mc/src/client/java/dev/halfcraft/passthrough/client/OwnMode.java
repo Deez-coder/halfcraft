@@ -36,6 +36,9 @@ public final class OwnMode {
 	private static final Object MOTION = new Object();
 	private static double motionX, motionY;
 
+	/** The server (world) START last ran on. */
+	private static Object startedFor;
+
 	private OwnMode() {
 	}
 
@@ -45,9 +48,17 @@ public final class OwnMode {
 		Minecraft minecraft = Minecraft.getInstance();
 		LocalPlayer player = minecraft.player;
 		if (own) {
+			dev.halfcraft.passthrough.HsConfig.send();
+			// once per world: own mode also ends while Half Sword is tabbed out, and coming back put the player in
+			// survival again (and cleared his effects)
+			Object server = WorldBridge.server();
+			if (server == null || server == startedFor) {
+				return;
+			}
+
+			startedFor = server;
 			START.forEach(WorldBridge::command);
 			dev.halfcraft.passthrough.Kit.giveFirst();
-			dev.halfcraft.passthrough.HsConfig.send();
 			// frame generation in Half Sword: Minecraft only follows its real frames, and the balance's cap counts the
 			// made-up ones too (it held real frames at half once)
 			minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(
@@ -83,6 +94,7 @@ public final class OwnMode {
 
 	/** Render thread, end of the camera update: keep the mouse grabbed for play, and tell the host where the player is. */
 	public static void frame(final float partialTick) {
+		GpuPriority.update();
 		Minecraft minecraft = Minecraft.getInstance();
 		LocalPlayer player = minecraft.player;
 		if (player == null) {

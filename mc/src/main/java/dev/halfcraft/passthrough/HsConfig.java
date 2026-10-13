@@ -29,15 +29,18 @@ import net.minecraft.network.chat.Component;
  * <li>/hs part &lt;head|neck|torso|arms|legs&gt; &lt;x&gt;: hits on that body part, both ways</li>
  * <li>/hs weapon &lt;item id&gt; &lt;x&gt;: one Minecraft item's hits (e.g. diamond_sword)</li>
  * <li>/hs help (or just /hs): what every command does</li>
- * <li>/hs show; /hs reset: every setting back to its default</li>
+ * <li>/hs show; /hs changed: only the settings that aren't at their default; /hs reset: every setting back to its default</li>
  * <li>/hs clean [radius]: remove every placed block (default within 64), loose items, arrows, TNT; ground restored</li>
  * <li>/hs fixground: Half Sword scans its ground again and resends it</li>
  * <li>/hs fps &lt;n&gt;: Half Sword's frame cap (0 = none): what it leaves of the GPU goes to Minecraft</li>
  * <li>/hs kit save|give|reset|auto on|off: your inventory as the kit you get at the start of every Half Sword fight</li>
  * <li>/hs hostile on|off: neutral mobs (wolves, golems, bees, endermen...) attack the fighters and Steve on sight</li>
+ * <li>/hs priority on|off: Minecraft's GPU work goes first (its picture half as old on screen, Half Sword ~20% slower)</li>
  * <li>/hs balance on|off: each game no faster than a little above the other (the GPU goes to frames that are shown)</li>
  * <li>/hs mining on|off, /hs mining &lt;x&gt;: whether the fighters break Minecraft's blocks by hitting them, and how fast</li>
  * <li>/hs current &lt;x&gt;: how hard water's and lava's currents push the fighters</li>
+ * <li>/hs explosions &lt;x&gt;: how hard explosions (TNT, creepers...) throw the fighters, Steve and mobs (not how far they reach)</li>
+ * <li>/hs mace &lt;x&gt;: the mace's damage to the fighters (its blows and smashes)</li>
  * <li>/hs props &lt;x&gt;: how hard Steve's hits push Half Sword's loose things (candle stands, chains, weapons)</li>
  * <li>/hs ground, /hs why: for bug reports - how the ground under you was scanned (Half Sword's log), what the nearest
  * mob's pathfinding makes of where it stands</li>
@@ -58,11 +61,14 @@ public final class HsConfig {
 		boolean mining = true;
 		double current = 1.0;
 		double miningStrength = 1.0;
+		double explosions = 1.0;
+		double mace = 1.0;
 		Map<String, Double> parts = new LinkedHashMap<>();
 		Map<String, Double> weapons = new LinkedHashMap<>();
 		int fps = 0;
 		boolean syncExport = true;
 		boolean balance = true;
+		boolean gpuPriority = true;
 		boolean hostile = false;
 	}
 
@@ -71,6 +77,7 @@ public final class HsConfig {
 	static {
 		Passthrough.syncExport = data.syncExport;
 		Passthrough.balance = data.balance;
+		Passthrough.gpuPriority = data.gpuPriority;
 		MobWar.forceHostile = data.hostile;
 	}
 
@@ -114,6 +121,11 @@ public final class HsConfig {
 		return data.mining ? data.miningStrength : 0.0;
 	}
 
+	/** How hard explosions throw what they hit. */
+	public static double explosions() {
+		return data.explosions;
+	}
+
 	/** The multiplier for one Minecraft item's hits (1 if none set). */
 	public static double weapon(final String item) {
 		return data.weapons.getOrDefault(item, 1.0);
@@ -122,6 +134,7 @@ public final class HsConfig {
 	/** /hs help: every command, one line each. */
 	private static final String[][] HELP = {
 		{"/hs show", "see all your settings"},
+		{"/hs changed", "see only the settings you changed, and what they are now"},
 		{"/hs reset", "put every setting back to default"},
 		{"/hs dealt <x>", "how much damage you do to fighters (1 = normal, 2 = double)"},
 		{"/hs taken <x>", "how much damage fighters do to you"},
@@ -134,9 +147,12 @@ public final class HsConfig {
 		{"/hs kit auto on|off", "get the kit at the start of every fight, or keep what you carry"},
 		{"/hs hostile on|off", "wolves, golems, bees and other neutral mobs attack on sight"},
 		{"/hs balance on|off", "keeps both games' fps matched: smoother, less lag (on by default)"},
+		{"/hs priority on|off", "Minecraft's frames go first on the GPU: much less lag, Half Sword a bit slower (on by default)"},
 		{"/hs mining on|off", "fighters break your blocks by hitting them (on by default)"},
 		{"/hs mining <x>", "how fast fighters break blocks (1 = normal, 2 = twice as fast)"},
 		{"/hs current <x>", "how hard water and lava currents push fighters (1 = normal, 0 = not at all)"},
+		{"/hs explosions <x>", "how hard explosions throw fighters, you and mobs (1 = normal, 2 = twice as hard)"},
+		{"/hs mace <x>", "how much damage the mace does to fighters (1 = normal)"},
 		{"/hs props <x>", "how hard your hits push loose things in Half Sword (1 = normal, 0 = off)"},
 		{"/hs fps <n>", "cap Half Sword's fps (0 = no cap)"},
 		{"/hs clean [radius]", "remove everything you built nearby (blocks, items, arrows, TNT)"},
@@ -164,6 +180,8 @@ public final class HsConfig {
 		m.addProperty("potions", data.potions);
 		m.addProperty("props", data.props);
 		m.addProperty("current", data.current);
+		m.addProperty("explosions", data.explosions);
+		m.addProperty("mace", data.mace);
 		for (String p : PARTS) {
 			m.addProperty(p, data.parts.getOrDefault(p, 1.0));
 		}
@@ -238,6 +256,14 @@ public final class HsConfig {
 				data.current = DoubleArgumentType.getDouble(ctx, "multiplier");
 				return changed(ctx, String.format(Locale.ROOT, "currents push fighters x%.2f", data.current));
 			})))
+			.then(Commands.literal("explosions").then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.0, 100.0)).executes(ctx -> {
+				data.explosions = DoubleArgumentType.getDouble(ctx, "multiplier");
+				return changed(ctx, String.format(Locale.ROOT, "explosions throw x%.2f as hard", data.explosions));
+			})))
+			.then(Commands.literal("mace").then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.0, 100.0)).executes(ctx -> {
+				data.mace = DoubleArgumentType.getDouble(ctx, "multiplier");
+				return changed(ctx, String.format(Locale.ROOT, "mace damage x%.2f", data.mace));
+			})))
 			.then(Commands.literal("props").then(Commands.argument("multiplier", DoubleArgumentType.doubleArg(0.0, 100.0)).executes(ctx -> {
 				data.props = DoubleArgumentType.getDouble(ctx, "multiplier");
 				return changed(ctx, String.format(Locale.ROOT, "hits push loose things x%.2f", data.props));
@@ -283,6 +309,15 @@ public final class HsConfig {
 					data.hostile = MobWar.forceHostile = false;
 					return changed(ctx, "neutral mobs only fight back");
 				})))
+			.then(Commands.literal("priority")
+				.then(Commands.literal("on").executes(ctx -> {
+					data.gpuPriority = Passthrough.gpuPriority = true;
+					return changed(ctx, "Minecraft's frames go first on the GPU (less lag)");
+				}))
+				.then(Commands.literal("off").executes(ctx -> {
+					data.gpuPriority = Passthrough.gpuPriority = false;
+					return changed(ctx, "Minecraft and Half Sword share the GPU evenly (Half Sword faster, more lag)");
+				})))
 			.then(Commands.literal("balance")
 				.then(Commands.literal("on").executes(ctx -> {
 					data.balance = Passthrough.balance = true;
@@ -302,8 +337,8 @@ public final class HsConfig {
 					return changed(ctx, "Minecraft's frames handed over the old way");
 				})))
 			.then(Commands.literal("show").executes(ctx -> {
-				StringBuilder b = new StringBuilder(String.format(Locale.ROOT, "dealt x%.2f, taken x%.2f, potions x%.2f, props x%.2f, current x%.2f, mining %s, frame cap %d, balance %s, export %s, hostile %s",
-					data.dealt, data.taken, data.potions, data.props, data.current, data.mining ? String.format(Locale.ROOT, "x%.2f", data.miningStrength) : "off", data.fps, data.balance ? "on" : "off", data.syncExport ? "sync" : "async", data.hostile ? "on" : "off"));
+				StringBuilder b = new StringBuilder(String.format(Locale.ROOT, "dealt x%.2f, taken x%.2f, potions x%.2f, props x%.2f, current x%.2f, explosions x%.2f, mace x%.2f, mining %s, frame cap %d, balance %s, priority %s, export %s, hostile %s",
+					data.dealt, data.taken, data.potions, data.props, data.current, data.explosions, data.mace, data.mining ? String.format(Locale.ROOT, "x%.2f", data.miningStrength) : "off", data.fps, data.balance ? "on" : "off", data.gpuPriority ? "on" : "off", data.syncExport ? "sync" : "async", data.hostile ? "on" : "off"));
 				for (String p : PARTS) {
 					b.append(String.format(Locale.ROOT, ", %s x%.2f", p, data.parts.getOrDefault(p, 1.0)));
 				}
@@ -312,10 +347,12 @@ public final class HsConfig {
 				ctx.getSource().sendSystemMessage(Component.literal("Half Sword: " + b));
 				return 1;
 			}))
+			.then(Commands.literal("changed").executes(HsConfig::changedSettings))
 			.then(Commands.literal("reset").executes(ctx -> {
 				data = new Data();
 				Passthrough.syncExport = data.syncExport;
 				Passthrough.balance = data.balance;
+				Passthrough.gpuPriority = data.gpuPriority;
 				MobWar.forceHostile = data.hostile;
 				return changed(ctx, "every setting back to its default (damage x1, no frame cap, balance on, export sync, hostile off)");
 			}))
@@ -328,6 +365,55 @@ public final class HsConfig {
 				ctx.getSource().sendSystemMessage(Component.literal("Half Sword: the ground is scanned again"));
 				return 1;
 			})));
+	}
+
+	/** What each setting is called in /hs changed (the config file's names otherwise). */
+	private static final Map<String, String> NAMES = Map.ofEntries(Map.entry("dealt", "damage dealt"), Map.entry("taken", "damage taken"),
+		Map.entry("potions", "potion damage"), Map.entry("props", "props push"), Map.entry("mining", "fighters break blocks"),
+		Map.entry("miningStrength", "mining speed"), Map.entry("current", "currents push"), Map.entry("explosions", "explosion knockback"),
+		Map.entry("mace", "mace damage"), Map.entry("fps", "Half Sword frame cap"), Map.entry("syncExport", "sync export"),
+		Map.entry("balance", "balance"), Map.entry("gpuPriority", "GPU priority"), Map.entry("hostile", "hostile mobs"));
+
+	/** /hs changed: every setting that isn't at its default, with its value now (the kit's too). */
+	private static int changedSettings(final CommandContext<CommandSourceStack> ctx) {
+		JsonObject now = GSON.toJsonTree(data).getAsJsonObject();
+		JsonObject defaults = GSON.toJsonTree(new Data()).getAsJsonObject();
+		List<String> lines = new java.util.ArrayList<>();
+		for (Map.Entry<String, com.google.gson.JsonElement> e : now.entrySet()) {
+			if (e.getValue().isJsonObject()) {
+				// parts and weapons: each one set (at 1 it's no change)
+				for (Map.Entry<String, com.google.gson.JsonElement> x : e.getValue().getAsJsonObject().entrySet()) {
+					if (x.getValue().getAsDouble() != 1.0) {
+						lines.add(String.format(Locale.ROOT, "%s %s: x%.2f", e.getKey().equals("parts") ? "hits on" : "item", x.getKey(), x.getValue().getAsDouble()));
+					}
+				}
+			} else if (!e.getValue().equals(defaults.get(e.getKey()))) {
+				com.google.gson.JsonPrimitive v = e.getValue().getAsJsonPrimitive();
+				String value = v.isBoolean() ? (v.getAsBoolean() ? "on" : "off") : e.getKey().equals("fps") ? v.getAsString()
+					: String.format(Locale.ROOT, "x%.2f", v.getAsDouble());
+				lines.add(NAMES.getOrDefault(e.getKey(), e.getKey()) + ": " + value);
+			}
+		}
+
+		if (!Kit.auto) {
+			lines.add("kit every fight: off");
+		}
+
+		if (Kit.custom()) {
+			lines.add("kit: your own (saved)");
+		}
+
+		if (lines.isEmpty()) {
+			ctx.getSource().sendSystemMessage(Component.literal("Half Sword: every setting is at its default"));
+			return 1;
+		}
+
+		ctx.getSource().sendSystemMessage(Component.literal("Settings you changed:").withStyle(net.minecraft.ChatFormatting.YELLOW));
+		for (String line : lines) {
+			ctx.getSource().sendSystemMessage(Component.literal(line).withStyle(net.minecraft.ChatFormatting.GRAY));
+		}
+
+		return 1;
 	}
 
 	/** /hs clean [radius]: every placed block around the player goes, loose items too, and the ground is whole again. */

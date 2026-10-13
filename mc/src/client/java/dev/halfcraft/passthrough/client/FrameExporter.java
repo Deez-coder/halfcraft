@@ -29,6 +29,7 @@ import org.lwjgl.opengl.GL33C;
  *     +44 int flags: 1 = depth in [0, 1] (zZeroToOne), 2 = rows bottom-up, 4 = reversed Z (1 = near, 0 = far/empty)
  *     +48 double camera x, +56 y, +64 z   +72 float yaw   +76 pitch   +80 roll   +84 int first person
  *     +88 long capture time (System.nanoTime)   +96 long publish time
+ *     +104 long the shared fence's value once the frame is in the host's textures   +112 int their generation (GpuShare)
  * slot i data at 4096 + i * stride, each layer width * height * 4 bytes:
  *   world colour RGBA8 (premultiplied alpha), world depth float32, overlay RGBA8 (hand + HUD, premultiplied alpha)
  * </pre>
@@ -38,13 +39,15 @@ import org.lwjgl.opengl.GL33C;
  * render thread then waits for the GPU and publishes at once (the host shows it 1-2 Minecraft frames sooner);
  * otherwise a ring of GPU buffers is published when Minecraft next sees the fence pass. Each publish also sets the
  * event "Local\MCPassthroughFramePublished", so the host can copy the frame out straight away.
+ * Zero copy (GpuShare, sync export only): the layers go into the host's own textures for the slot instead (flag 8),
+ * and the slot's data stays unwritten.
  */
 public final class FrameExporter {
 	public static final String NAME = "Local\\MCPassthroughFrame";
 	private static final int MAGIC = 0x5450434D;
 	private static final int VERSION = 1;
 	private static final int HEADER = 4096;
-	private static final int SLOTS = 6; // the host shows the frame matching its camera, not just the newest
+	static final int SLOTS = 6; // the host shows the frame matching its camera, not just the newest
 	private static final int SLOT_DESC = 256;
 	private static final int SLOT_DESC_BYTES = 128;
 	private static final int MAX_W = 2560;
@@ -83,6 +86,7 @@ public final class FrameExporter {
 	private static long statsCopyNanos;
 	private static long statsMaxCopyNanos;
 	private static int statsSkipped; // captures skipped: every buffer in the ring still waiting for the GPU
+	private static int statsZeroCopy; // frames that went GPU to GPU (GpuShare)
 	private static long statsWaitNanos; // the render thread waiting for the GPU (sync export)
 	private static long statsAgeNanos; // capture to publish
 	private static final int GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117;
@@ -101,10 +105,17 @@ public final class FrameExporter {
 		GpuBuffer overlay;
 		int width;
 		int height;
+		/** The buffers' size (they may be older than a zero copy frame's). */
+		int bufW;
+		int bufH;
 		long generation;
 		boolean busy;
 		long busySince;
 		HostState.Pose pose;
+		/** Zero copy: the slot whose shared textures have this frame (-1: it goes through the buffers). */
+		int slot = -1;
+		int gpuGeneration;
+		long fence;
 		float far;
 		long frame;
 		long captureNanos;
@@ -117,8 +128,8 @@ public final class FrameExporter {
 			this.color = RenderSystem.getDevice().createBuffer(() -> "passthrough world colour", usage, n);
 			this.depth = RenderSystem.getDevice().createBuffer(() -> "passthrough world depth", usage, n);
 			this.overlay = RenderSystem.getDevice().createBuffer(() -> "passthrough overlay", usage, n);
-			this.width = w;
-			this.height = h;
+			this.bufW = w;
+			this.bufH = h;
 		}
 
 		void free() {
@@ -206,10 +217,13 @@ public final class FrameExporter {
 			return;
 		}
 
-		if (c.width != w || c.height != h || c.color == null) {
+		boolean gpu = Passthrough.syncExport && GpuShare.ready(target.getColorTexture(), target.getDepthTexture(), w, h);
+		if (!gpu && (c.bufW != w || c.bufH != h || c.color == null)) {
 			c.allocate(w, h);
 		}
 
+		c.width = w;
+		c.height = h;
 		c.generation++;
 		c.busy = true;
 		c.busySince = now;
@@ -218,8 +232,23 @@ public final class FrameExporter {
 		c.frame = ++frameCounter;
 		c.captureNanos = now;
 		CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
-		encoder.copyTextureToBuffer(target.getColorTexture(), c.color, 0L, () -> {}, 0);
-		encoder.copyTextureToBuffer(target.getDepthTexture(), c.depth, 0L, () -> {}, 0);
+		if (gpu) {
+			c.slot = slotNext;
+			slotNext = (slotNext + 1) % SLOTS;
+			c.gpuGeneration = GpuShare.generation();
+			try {
+				GpuShare.copyWorld(target.getColorTexture(), target.getDepthTexture(), c.slot);
+			} catch (RuntimeException e) {
+				GpuShare.fail(e);
+				c.busy = false;
+				return;
+			}
+		} else {
+			c.slot = -1;
+			encoder.copyTextureToBuffer(target.getColorTexture(), c.color, 0L, () -> {}, 0);
+			encoder.copyTextureToBuffer(target.getDepthTexture(), c.depth, 0L, () -> {}, 0);
+		}
+
 		encoder.clearColorTexture(target.getColorTexture(), TRANSPARENT);
 		current = c;
 	}
@@ -238,11 +267,21 @@ public final class FrameExporter {
 		}
 
 		long generation = c.generation;
-		RenderSystem.getDevice().createCommandEncoder().copyTextureToBuffer(target.getColorTexture(), c.overlay, 0L, () -> {
-			if (c.generation == generation && c.busy) {
-				publish(c);
+		if (c.slot >= 0) {
+			try {
+				c.fence = GpuShare.copyOverlay(target.getColorTexture(), c.slot);
+			} catch (RuntimeException e) {
+				GpuShare.fail(e);
+				c.busy = false;
+				return;
 			}
-		}, 0);
+		} else {
+			RenderSystem.getDevice().createCommandEncoder().copyTextureToBuffer(target.getColorTexture(), c.overlay, 0L, () -> {
+				if (c.generation == generation && c.busy) {
+					publish(c);
+				}
+			}, 0);
+		}
 		ringNext = (ringNext + 1) % RING;
 		if (Passthrough.syncExport) {
 			// wait for this frame's GPU work here and publish now: otherwise Minecraft only notices the fence at the
@@ -254,6 +293,7 @@ public final class FrameExporter {
 			statsWaitNanos += System.nanoTime() - waitStart;
 			if (r != GL_TIMEOUT_EXPIRED && r != GL_WAIT_FAILED && c.generation == generation && c.busy) {
 				publish(c);
+				Pacer.published();
 			}
 		}
 	}
@@ -261,8 +301,12 @@ public final class FrameExporter {
 	private static void publish(final Capture c) {
 		try {
 			MemorySegment m = shm.segment;
-			int slot = slotNext;
-			slotNext = (slotNext + 1) % SLOTS;
+			int slot = c.slot;
+			if (slot < 0) {
+				slot = slotNext;
+				slotNext = (slotNext + 1) % SLOTS;
+			}
+
 			long desc = SLOT_DESC + (long)SLOT_DESC_BYTES * slot;
 			long seq = m.get(LONG, desc);
 			if ((seq & 1L) != 0L) {
@@ -274,7 +318,12 @@ public final class FrameExporter {
 			long base = HEADER + STRIDE * slot;
 			long n = (long)c.width * c.height * 4;
 			long copyStart = System.nanoTime();
-			copyAll(new GpuBuffer[] {c.color, c.depth, c.overlay}, m, base, n);
+			if (c.slot >= 0) {
+				statsZeroCopy++;
+			} else {
+				copyAll(new GpuBuffer[] {c.color, c.depth, c.overlay}, m, base, n);
+			}
+
 			long copyNanos = System.nanoTime() - copyStart;
 			statsAgeNanos += copyStart - c.captureNanos;
 			statsPublished++;
@@ -282,10 +331,10 @@ public final class FrameExporter {
 			statsMaxCopyNanos = Math.max(statsMaxCopyNanos, copyNanos);
 			if (copyStart - statsSince >= 2_000_000_000L) {
 				if (statsSince != 0 && statsPublished > 0) {
-					Passthrough.LOG.info("frame export: {} frames/s at {}x{} (Minecraft {} fps, {} skipped, {}), copy {} ms avg, {} ms max, "
+					Passthrough.LOG.info("frame export: {} frames/s at {}x{} (Minecraft {} fps, {} skipped, {}, {} zero copy), copy {} ms avg, {} ms max, "
 						+ "capture to publish {} ms avg, GPU wait {} ms per frame",
 						statsPublished * 1_000_000_000L / (copyStart - statsSince), c.width, c.height, net.minecraft.client.Minecraft.getInstance().getFps(),
-						statsSkipped, Passthrough.syncExport ? "sync" : "async", String.format(java.util.Locale.ROOT, "%.2f", statsCopyNanos / 1.0e6 / statsPublished),
+						statsSkipped, Passthrough.syncExport ? "sync" : "async", statsZeroCopy, String.format(java.util.Locale.ROOT, "%.2f", statsCopyNanos / 1.0e6 / statsPublished),
 						String.format(java.util.Locale.ROOT, "%.2f", statsMaxCopyNanos / 1.0e6),
 						String.format(java.util.Locale.ROOT, "%.2f", statsAgeNanos / 1.0e6 / statsPublished),
 						String.format(java.util.Locale.ROOT, "%.2f", statsWaitNanos / 1.0e6 / statsPublished));
@@ -296,6 +345,7 @@ public final class FrameExporter {
 				statsCopyNanos = 0;
 				statsMaxCopyNanos = 0;
 				statsSkipped = 0;
+				statsZeroCopy = 0;
 				statsWaitNanos = 0;
 				statsAgeNanos = 0;
 			}
@@ -307,7 +357,7 @@ public final class FrameExporter {
 			m.set(FLOAT, desc + 32, NEAR);
 			m.set(FLOAT, desc + 36, c.far);
 			m.set(FLOAT, desc + 40, p.fov());
-			m.set(INT, desc + 44, (RenderSystem.getDevice().getDeviceInfo().isZZeroToOne() ? 1 : 0) | 2 | 4);
+			m.set(INT, desc + 44, (RenderSystem.getDevice().getDeviceInfo().isZZeroToOne() ? 1 : 0) | 2 | 4 | (c.slot >= 0 ? 8 : 0));
 			m.set(DOUBLE, desc + 48, p.x());
 			m.set(DOUBLE, desc + 56, p.y());
 			m.set(DOUBLE, desc + 64, p.z());
@@ -317,6 +367,8 @@ public final class FrameExporter {
 			m.set(INT, desc + 84, p.firstPerson() ? 1 : 0);
 			m.set(LONG, desc + 88, c.captureNanos);
 			m.set(LONG, desc + 96, System.nanoTime());
+			m.set(LONG, desc + 104, c.fence);
+			m.set(INT, desc + 112, c.gpuGeneration);
 			VarHandle.fullFence();
 			m.set(LONG, desc, seq + 2L);
 			m.set(INT, 40, slot);

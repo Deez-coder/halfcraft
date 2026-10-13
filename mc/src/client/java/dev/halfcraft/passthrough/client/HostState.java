@@ -35,7 +35,7 @@ public final class HostState {
 	private static Pose frame;
 	/** Half Sword's frame time, from its heartbeat ("own", one per frame): smoothed, nanoseconds (0: unknown). */
 	private static volatile long hostFrameNanos;
-	private static long lastOwnNanos;
+	private static volatile long lastOwnNanos;
 	/** Whether the last frame was in own mode (to notice the switch). Render thread only. */
 	private static boolean wasOwn;
 
@@ -77,6 +77,11 @@ public final class HostState {
 
 		latest = new Pose(m.has("f") ? m.get("f").getAsLong() : 0L, 0, 0, 0, 0, 0, 0, 70.0F, true, 0, 0, 0, 0, System.nanoTime(),
 			false, 0, 0, false, true);
+	}
+
+	/** When Half Sword's last heartbeat came (System.nanoTime): it sends it as it starts a frame, its camera just set. */
+	static long lastTickNanos() {
+		return lastOwnNanos;
 	}
 
 	/** Half Sword's smoothed frame time in nanoseconds, or 0 when it isn't driving. */

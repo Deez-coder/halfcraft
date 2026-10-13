@@ -52,19 +52,7 @@ public class PassthroughClient implements ClientModInitializer {
 		"gamerule show_advancement_messages false",
 		"gamerule player_movement_check false",
 		"time set noon",
-		"weather clear",
-		"clear @a",
-		"item replace entity @a hotbar.0 with minecraft:ender_pearl 16",
-		"item replace entity @a hotbar.1 with minecraft:diamond_sword",
-		"item replace entity @a hotbar.2 with minecraft:crossbow[enchantments={multishot:1,quick_charge:3}]",
-		"item replace entity @a hotbar.3 with minecraft:bow[enchantments={power:5,infinity:1}]",
-		"item replace entity @a hotbar.4 with minecraft:tnt 64",
-		"item replace entity @a hotbar.5 with minecraft:flint_and_steel",
-		"item replace entity @a hotbar.6 with minecraft:creeper_spawn_egg 64",
-		"item replace entity @a hotbar.7 with minecraft:grass_block 64",
-		"item replace entity @a hotbar.8 with minecraft:firework_rocket 64",
-		"give @a minecraft:arrow 64",
-		"item replace entity @a weapon.offhand with minecraft:firework_rocket[fireworks={flight_duration:3,explosions:[{shape:\"large_ball\",colors:[I;16733525,16755200],has_trail:true}]}] 64"
+		"weather clear"
 	);
 	private static boolean configured;
 	private static boolean worldRequested;
