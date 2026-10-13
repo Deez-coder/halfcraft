@@ -87,7 +87,7 @@ namespace
 		double dealt = 1.0, taken = 1.0, potions = 1.0;
 		double part[kParts] = {1, 1, 1, 1, 1};
 		int fps = 0; // Half Sword's frame cap (/hs fps, 0 = none): what it leaves of the GPU, Minecraft gets
-		bool balance = true; // cap Half Sword a little above Minecraft's rate (Minecraft does the same the other way)
+		bool balance = false; // cap Half Sword a little above Minecraft's rate (Minecraft does the same the other way)
 		double props = 1.0;  // how hard Steve's blows push loose things (/hs props)
 		double current = 1.0; // how hard water's and lava's currents push the fighters (/hs current)
 		double explosions = 1.0; // how hard explosions throw them (/hs explosions)
@@ -2017,7 +2017,7 @@ namespace
 		for (int p = 0; p < kParts; ++p)
 			g_cfg.part[p] = json_num(m, kPartNames[p], 1.0);
 		g_cfg.fps = int(json_num(m, "fps", 0.0));
-		g_cfg.balance = json_num(m, "balance", 1.0) != 0.0;
+		g_cfg.balance = json_num(m, "balance", 0.0) != 0.0;
 		g_cfg.props = json_num(m, "props", 1.0);
 		g_cfg.current = json_num(m, "current", 1.0);
 		g_cfg.explosions = json_num(m, "explosions", 1.0);

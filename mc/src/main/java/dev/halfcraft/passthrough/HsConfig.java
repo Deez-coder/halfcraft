@@ -67,7 +67,7 @@ public final class HsConfig {
 		Map<String, Double> weapons = new LinkedHashMap<>();
 		int fps = 0;
 		boolean syncExport = true;
-		boolean balance = true;
+		boolean balance = false;
 		boolean gpuPriority = true;
 		boolean hostile = false;
 	}
@@ -146,7 +146,7 @@ public final class HsConfig {
 		{"/hs kit reset", "go back to the built-in kit"},
 		{"/hs kit auto on|off", "get the kit at the start of every fight, or keep what you carry"},
 		{"/hs hostile on|off", "wolves, golems, bees and other neutral mobs attack on sight"},
-		{"/hs balance on|off", "keeps both games' fps matched: smoother, less lag (on by default)"},
+		{"/hs balance on|off", "keeps both games' fps matched: can be smoother with less lag on some PCs (off by default)"},
 		{"/hs priority on|off", "Minecraft's frames go first on the GPU: much less lag, Half Sword a bit slower (on by default)"},
 		{"/hs mining on|off", "fighters break your blocks by hitting them (on by default)"},
 		{"/hs mining <x>", "how fast fighters break blocks (1 = normal, 2 = twice as fast)"},
@@ -354,7 +354,7 @@ public final class HsConfig {
 				Passthrough.balance = data.balance;
 				Passthrough.gpuPriority = data.gpuPriority;
 				MobWar.forceHostile = data.hostile;
-				return changed(ctx, "every setting back to its default (damage x1, no frame cap, balance on, export sync, hostile off)");
+				return changed(ctx, "every setting back to its default (damage x1, no frame cap, balance off, export sync, hostile off)");
 			}))
 			.then(Commands.literal("clean")
 				.executes(ctx -> clean(ctx, 64))

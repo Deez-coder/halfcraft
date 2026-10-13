@@ -24,7 +24,7 @@ public class Passthrough implements ModInitializer {
 	 */
 	public static volatile boolean syncExport = true;
 	/** Minecraft and Half Sword cap themselves a little above each other's frame rate (/hs balance on|off). */
-	public static volatile boolean balance = true;
+	public static volatile boolean balance = false;
 	/** Minecraft's GPU work goes first while Half Sword drives (/hs priority: lower latency, Half Sword a little slower). */
 	public static volatile boolean gpuPriority = true;
 	/** Where events for the host go (JSON lines); the client's HostLink sets it. */

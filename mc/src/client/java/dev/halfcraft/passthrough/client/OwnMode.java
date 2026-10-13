@@ -62,8 +62,8 @@ public final class OwnMode {
 			// frame generation in Half Sword: Minecraft only follows its real frames, and the balance's cap counts the
 			// made-up ones too (it held real frames at half once)
 			minecraft.gui.hud.getChat().addClientSystemMessage(net.minecraft.network.chat.Component.literal(
-				"§e[Half Sword] If you get low fps or input lag: turn OFF frame generation in Half Sword's graphics settings "
-					+ "and turn the balance ON with /hs balance on."));
+				"§e[Half Sword] If you get low fps, stutters or input lag, try /hs priority on|off and /hs balance on|off, "
+					+ "and turning frame generation off in Half Sword's graphics settings."));
 			if (player != null) {
 				player.getAbilities().flying = false;
 				player.onUpdateAbilities();
